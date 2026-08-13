@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import subprocess
+import time
 from collections import Counter
 from fractions import Fraction
 from pathlib import Path
@@ -425,6 +426,8 @@ def compute_match_noise_graph(
     with offset = source_center_index - pad - best_index
     (source clip starts `pad` frames before dest usable content).
     """
+    t0 = time.perf_counter()
+    log.info("match-noise: probe %s / %s", source_clip.name, dest_clip.name)
     src_meta = probe_video(source_clip)
     dst_meta = probe_video(dest_clip)
     src_fps = src_meta["fps"] or 30.0
@@ -439,12 +442,22 @@ def compute_match_noise_graph(
     source_center_idx = max(0, (src_frame_count - 1) // 2)
     source_center_t = source_center_idx / src_fps
 
+    log.info(
+        "match-noise: usable_frames=%s start=%.2fs center_idx=%s (probe %.1fs)",
+        usable_frames,
+        usable_start,
+        source_center_idx,
+        time.perf_counter() - t0,
+    )
+
+    t_center = time.perf_counter()
     src_png = extract_frame_at_time(source_clip, source_center_t)
     arr = np.frombuffer(src_png, dtype=np.uint8)
     src_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if src_bgr is None:
         raise ValueError("Could not decode source center frame")
     src_g = _gray_small_bgr(src_bgr)
+    log.info("match-noise: source center extracted (%.1fs)", time.perf_counter() - t_center)
 
     values: list[float] = []
     consecutive: list[float] = []
@@ -454,6 +467,8 @@ def compute_match_noise_graph(
     if not cap.isOpened():
         raise ValueError("Could not open dest clip for noise graph")
 
+    t_loop = time.perf_counter()
+    progress_every = max(1, usable_frames // 10)
     try:
         start_frame = int(usable_start * dst_fps)
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -497,6 +512,19 @@ def compute_match_noise_graph(
             mse = float(np.mean((src_g.astype(np.float64) - g.astype(np.float64)) ** 2))
             values.append(mse)
             prev_g = dest_g
+
+            if (i + 1) % progress_every == 0 or i + 1 == usable_frames:
+                elapsed = time.perf_counter() - t_loop
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                remaining = usable_frames - (i + 1)
+                eta = remaining / rate if rate > 0 else 0
+                log.info(
+                    "match-noise: %s/%s frames (%.0f fps, ~%.0fs left)",
+                    i + 1,
+                    usable_frames,
+                    rate,
+                    eta,
+                )
     finally:
         cap.release()
 
@@ -522,6 +550,17 @@ def compute_match_noise_graph(
 
     sel_vals = [v for _, v in finite_sel]
     scale_max = float(max(sel_vals)) if sel_vals else float(best_mse)
+
+    log.info(
+        "match-noise: done best=%s mse=%.1f offset=%s cuts=%s window=[%s,%s] (%.1fs total)",
+        best_index,
+        best_mse,
+        suggested_offset,
+        scene_cuts,
+        sel_start,
+        sel_end,
+        time.perf_counter() - t0,
+    )
 
     return {
         "values": values,
@@ -648,6 +687,7 @@ def compute_preview_noise_score(
     """
     from app.diff import compare_png_bytes
 
+    t0 = time.perf_counter()
     meta = preview_meta(source_clip, dest_clip)
     n = int(meta["usable_frame_count"])
     if n <= 0:
@@ -659,12 +699,23 @@ def compute_preview_noise_score(
         step = (n - 1) / (max_frames - 1)
         indices = sorted({int(round(i * step)) for i in range(max_frames)})
 
+    log.info(
+        "noise-score: scoring %s/%s frames offset=%s src=%s dest=%s",
+        len(indices),
+        n,
+        offset,
+        source_clip.name,
+        dest_clip.name,
+    )
+
     ssims: list[float] = []
     psnrs: list[float] = []
     mses: list[float] = []
     skipped = 0
+    progress_every = max(1, len(indices) // 10)
+    t_loop = time.perf_counter()
 
-    for idx in indices:
+    for i, idx in enumerate(indices):
         pair = resolve_preview_pair(
             source_clip=source_clip,
             dest_clip=dest_clip,
@@ -678,13 +729,30 @@ def compute_preview_noise_score(
             continue
         try:
             m = compare_png_bytes(pair["source"], pair["dest"])
-        except Exception:
+        except Exception as exc:
             skipped += 1
+            log.debug("noise-score: frame %s compare failed: %s", idx, exc)
             continue
         ssims.append(float(m["ssim"]))
         mses.append(float(m["mse"]))
         if m["psnr"] is not None:
             psnrs.append(float(m["psnr"]))
+
+        done = i + 1
+        if done % progress_every == 0 or done == len(indices):
+            elapsed = time.perf_counter() - t_loop
+            rate = done / elapsed if elapsed > 0 else 0
+            remaining = len(indices) - done
+            eta = remaining / rate if rate > 0 else 0
+            log.info(
+                "noise-score: %s/%s sampled (ok=%s skip=%s, %.1f/s, ~%.0fs left)",
+                done,
+                len(indices),
+                len(ssims),
+                skipped,
+                rate,
+                eta,
+            )
 
     if not ssims:
         raise ValueError("No valid frame pairs to score (all OOB or failed)")
@@ -701,6 +769,17 @@ def compute_preview_noise_score(
         psnr_mean, psnr_std = _mean_std(psnrs)
     else:
         psnr_mean, psnr_std = None, None
+
+    log.info(
+        "noise-score: done ssim=%.4f±%.4f psnr=%s mse=%.2f n=%s skip=%s (%.1fs)",
+        ssim_mean,
+        ssim_std,
+        f"{psnr_mean:.2f}" if psnr_mean is not None else "—",
+        mse_mean,
+        len(ssims),
+        skipped,
+        time.perf_counter() - t0,
+    )
 
     return {
         "frame_count": len(ssims),

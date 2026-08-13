@@ -8,6 +8,7 @@ import logging
 import re
 import shutil
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -73,13 +74,20 @@ from app.ws import manager
 ensure_dirs()
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] %(message)s",
+    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(LOG_FILE),
     ],
+    force=True,
 )
+# Keep third-party noise down; our app packages stay INFO
+logging.getLogger("uvicorn").setLevel(logging.INFO)
+logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 
@@ -87,9 +95,16 @@ log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     ensure_dirs()
     init_db()
+    log.info(
+        "API starting — watch=%s output=%s media=%s",
+        WATCH_BASE,
+        OUTPUT_BASE,
+        MEDIA_BASE,
+    )
     asyncio.create_task(watch_folders())
     asyncio.create_task(broadcast_system_loop())
     yield
+    log.info("API shutting down")
 
 
 app = FastAPI(title="Online Encoder", lifespan=lifespan)
@@ -103,12 +118,35 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def log_unhandled_errors(request: Request, call_next) -> Response:
-    try:
+async def log_requests(request: Request, call_next) -> Response:
+    # Skip chatty health checks
+    path = request.url.path
+    if path in ("/health", "/api/status", "/status"):
         return await call_next(request)
+
+    t0 = time.perf_counter()
+    try:
+        response = await call_next(request)
     except Exception:
-        log.exception("Unhandled error on %s %s", request.method, request.url.path)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        log.exception(
+            "Unhandled error on %s %s (%.0fms)",
+            request.method,
+            path,
+            elapsed_ms,
+        )
         raise
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    level = logging.WARNING if response.status_code >= 400 else logging.INFO
+    log.log(
+        level,
+        "%s %s → %s (%.0fms)",
+        request.method,
+        path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 app.mount("/media", StaticFiles(directory=str(MEDIA_BASE)), name="media")
 
@@ -668,9 +706,26 @@ async def get_preview_noise(job_id: int):
         if not src.exists() or not dst.exists():
             raise HTTPException(status_code=404, detail="Clip files missing")
 
+        log.info(
+            "preview-noise start job=%s src=%s dest=%s",
+            job_id,
+            src.name,
+            dst.name,
+        )
+        t0 = time.perf_counter()
         result = await asyncio.to_thread(compute_match_noise_graph, src, dst)
+        log.info(
+            "preview-noise done job=%s frames=%s best=%s offset=%s cuts=%s (%.1fs)",
+            job_id,
+            result.get("frame_count"),
+            result.get("best_index"),
+            result.get("suggested_offset"),
+            len(result.get("scene_cuts") or []),
+            time.perf_counter() - t0,
+        )
         return JSONResponse(result)
     except ValueError as exc:
+        log.warning("preview-noise failed job=%s: %s", job_id, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         db.close()
@@ -685,6 +740,14 @@ async def preview_diff(
 ):
     if mode not in ("absdiff", "ssim_map"):
         raise HTTPException(status_code=400, detail="mode must be absdiff or ssim_map")
+    log.info(
+        "preview-diff start job=%s index=%s offset=%s mode=%s",
+        job_id,
+        index,
+        offset,
+        mode,
+    )
+    t0 = time.perf_counter()
     # Reuse frame endpoint logic then compare in memory
     frame_resp = await get_preview_frame(job_id, index=index, offset=offset)
     data = frame_resp.body
@@ -701,6 +764,14 @@ async def preview_diff(
         sp.write_bytes(base64.b64decode(payload["source"]))
         dp.write_bytes(base64.b64decode(payload["dest"]))
         result = await asyncio.to_thread(_cmp, sp, dp, mode)  # type: ignore[arg-type]
+        log.info(
+            "preview-diff done job=%s mode=%s ssim=%.4f mse=%.2f (%.1fs)",
+            job_id,
+            mode,
+            result.get("ssim") or 0,
+            result.get("mse") or 0,
+            time.perf_counter() - t0,
+        )
         return JSONResponse(result)
 
 
@@ -711,8 +782,10 @@ async def set_frame_offset(job_id: int, offset: int = 0):
         job = db.get(EncodeJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
+        prev = job.frame_offset
         job.frame_offset = offset
         db.commit()
+        log.info("frame-offset job=%s %s → %s", job_id, prev, offset)
         return JSONResponse(job_to_dict(job, db))
     finally:
         db.close()
@@ -745,6 +818,16 @@ async def post_preview_noise_score(job_id: int, offset: int | None = None):
             except Exception:
                 clip_start = None
 
+        log.info(
+            "noise-score start job=%s offset=%s src=%s dest=%s full_source=%s",
+            job_id,
+            off,
+            src.name,
+            dst.name,
+            bool(full_source and full_source.exists()),
+        )
+        t0 = time.perf_counter()
+
         def _score():
             return compute_preview_noise_score(
                 source_clip=src,
@@ -757,6 +840,7 @@ async def post_preview_noise_score(job_id: int, offset: int | None = None):
         try:
             result = await asyncio.to_thread(_score)
         except ValueError as exc:
+            log.warning("noise-score failed job=%s: %s", job_id, exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         job.frame_offset = off
@@ -773,6 +857,18 @@ async def post_preview_noise_score(job_id: int, offset: int | None = None):
         db.commit()
         db.refresh(job)
 
+        log.info(
+            "noise-score done job=%s frames=%s skipped=%s "
+            "ssim=%.4f±%.4f psnr=%s mse=%.2f (%.1fs)",
+            job_id,
+            result["frame_count"],
+            result["skipped"],
+            result["ssim_mean"],
+            result["ssim_std"],
+            f"{result['psnr_mean']:.2f}" if result["psnr_mean"] is not None else "—",
+            result["mse_mean"],
+            time.perf_counter() - t0,
+        )
         return JSONResponse({**result, "job": job_to_dict(job, db)})
     finally:
         db.close()
@@ -1047,7 +1143,16 @@ async def run_diff(job_id: int, position: float = 0.5, mode: str = "absdiff"):
         if not src.exists() or not dst.exists():
             raise HTTPException(status_code=404, detail="Frame image missing on disk")
 
+        t0 = time.perf_counter()
         result = await asyncio.to_thread(compare_frame_files, src, dst, mode)  # type: ignore[arg-type]
+        log.info(
+            "compare-diff job=%s pos=%.2f mode=%s ssim=%.4f (%.1fs)",
+            job_id,
+            position,
+            mode,
+            result.get("ssim") or 0,
+            time.perf_counter() - t0,
+        )
         return JSONResponse(result)
     finally:
         db.close()
