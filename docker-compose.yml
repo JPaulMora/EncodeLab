@@ -4,12 +4,24 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/app:/app/app
-      - ./backend/data:/data
-      - ./config/presets:/config/presets:ro
+      # Named volume — host bind mounts are empty under this Docker Desktop path
+      - encoder_data:/data
+      - encoder_presets:/config/presets
     environment:
       ENCODER_DATA_DIR: /data
       HANDBRAKE_PRESET_JSON: /config/presets/Super8Scan.json
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
 
   svelte:
     build: ./frontend
@@ -18,4 +30,9 @@ services:
     environment:
       VITE_API_PROXY: http://api:8000
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+
+volumes:
+  encoder_data:
+  encoder_presets:
