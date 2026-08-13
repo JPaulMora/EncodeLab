@@ -1,0 +1,25 @@
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/data:/data
+      - ./config/presets:/config/presets:ro
+    environment:
+      ENCODER_DATA_DIR: /data
+      HANDBRAKE_PRESET_JSON: /config/presets/Super8Scan.json
+
+  svelte:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/static:/app/static
+    environment:
+      # Browser hits host-mapped API; Vite proxy inside container uses this
+      VITE_API_PROXY: http://api:8000
+    depends_on:
+      - api

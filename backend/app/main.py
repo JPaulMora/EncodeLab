@@ -25,7 +25,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import joinedload
 
 from app.config import (
     LOG_FILE,
@@ -39,7 +39,7 @@ from app.config import (
 )
 from app.db import SessionLocal, init_db
 from app.diff import compare_frame_files
-from app.encoder import _encoding_lock, extract_only, get_current_encode_file, run_encode
+from app.encoder import extract_only, get_current_encode_file
 from app.models import ComparisonFrame, EncodeJob
 from app.watcher import broadcast_system_loop, broadcast_watch_update, list_watch_files, watch_folders
 from app.ws import manager
