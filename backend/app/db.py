@@ -41,18 +41,10 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Run Alembic migrations to head (preferred over create_all)."""
-    from alembic import command
-    from alembic.config import Config
-    from pathlib import Path
+    """Ensure models are imported.
 
+    Schema migrations run once at container start via
+    ``alembic upgrade head`` in the Docker CMD — do not re-run Alembic here.
+    Alembic mutates global logging and can hang the ASGI lifespan.
+    """
     from app import models  # noqa: F401
-    from app.logging_config import setup_logging
-    from app.config import LOG_FILE
-
-    ini = Path(__file__).resolve().parent.parent / "alembic.ini"
-    cfg = Config(str(ini))
-    cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
-    command.upgrade(cfg, "head")
-    # Alembic mutates the global logging config — put console logs back
-    setup_logging(LOG_FILE)
