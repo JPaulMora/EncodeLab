@@ -77,26 +77,26 @@ setup_logging(LOG_FILE)
 log = logging.getLogger(__name__)
 
 
+def _console(msg: str) -> None:
+    print(msg, flush=True)
+    log.info(msg)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Re-apply after uvicorn may have reset logging
+    # Re-apply after uvicorn's --log-config may have reset handlers
     setup_logging(LOG_FILE)
     ensure_dirs()
-    log.info(
-        "API starting — watch=%s output=%s media=%s",
-        WATCH_BASE,
-        OUTPUT_BASE,
-        MEDIA_BASE,
+    _console(
+        f"API starting — watch={WATCH_BASE} output={OUTPUT_BASE} media={MEDIA_BASE}"
     )
     init_db()
-    # Alembic reconfigures logging — restore console handlers
-    setup_logging(LOG_FILE)
-    log.info("DB ready")
+    _console("DB ready")
     asyncio.create_task(watch_folders())
     asyncio.create_task(broadcast_system_loop())
-    log.info("Background watcher + system broadcast started")
+    _console("Background watcher + system broadcast started")
     yield
-    log.info("API shutting down")
+    _console("API shutting down")
 
 
 app = FastAPI(title="Online Encoder", lifespan=lifespan)
@@ -121,6 +121,10 @@ async def log_requests(request: Request, call_next) -> Response:
         response = await call_next(request)
     except Exception:
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(
+            f"Unhandled error on {request.method} {path} ({elapsed_ms:.0f}ms)",
+            flush=True,
+        )
         log.exception(
             "Unhandled error on %s %s (%.0fms)",
             request.method,
@@ -129,15 +133,10 @@ async def log_requests(request: Request, call_next) -> Response:
         )
         raise
     elapsed_ms = (time.perf_counter() - t0) * 1000
+    line = f"{request.method} {path} → {response.status_code} ({elapsed_ms:.0f}ms)"
+    print(line, flush=True)
     level = logging.WARNING if response.status_code >= 400 else logging.INFO
-    log.log(
-        level,
-        "%s %s → %s (%.0fms)",
-        request.method,
-        path,
-        response.status_code,
-        elapsed_ms,
-    )
+    log.log(level, line)
     return response
 
 app.mount("/media", StaticFiles(directory=str(MEDIA_BASE)), name="media")
