@@ -263,21 +263,6 @@
         </label>
       {/if}
 
-      <div class="thumbs">
-        {#if currentFrame?.source_url}
-          <figure>
-            <img src={currentFrame.source_url} alt="Source" />
-            <figcaption>Source</figcaption>
-          </figure>
-        {/if}
-        {#if currentFrame?.dest_url}
-          <figure>
-            <img src={currentFrame.dest_url} alt="Dest" />
-            <figcaption>Encoded</figcaption>
-          </figure>
-        {/if}
-      </div>
-
       <div class="preview checker">
         {#if previewUrl}
           <img src={previewUrl} alt="Comparison" />
@@ -452,26 +437,6 @@
     font-size: 12px;
     color: var(--muted);
     margin-bottom: 14px;
-  }
-  .thumbs {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    margin-bottom: 16px;
-  }
-  .thumbs figure {
-    margin: 0;
-  }
-  .thumbs img {
-    width: 100%;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    display: block;
-  }
-  .thumbs figcaption {
-    font-size: 11px;
-    color: var(--muted);
-    margin-top: 4px;
   }
   .preview {
     position: relative;
