@@ -62,6 +62,29 @@ npm run dev
 
 Vite proxies `/api` and `/ws` to `:8000`.
 
+## Nginx reverse proxy
+
+Library and external-compare uploads POST **16 MiB chunks**. Nginx’s default `client_max_body_size` is **1m**, which returns **413 Request Entity Too Large**.
+
+Use the example at [`config/nginx/encodelab.conf`](config/nginx/encodelab.conf):
+
+1. Point `server_name` at your host.
+2. Keep `client_max_body_size` at **64m** (or `0` to disable the limit). Chunks are 16 MiB plus multipart overhead — `1m` will fail.
+3. Proxy `/api/` and `/media/` to the API (`:8000`), `/ws` with WebSocket upgrade headers, and `/` to the UI (`:5173`).
+4. Leave `proxy_request_buffering off` so nginx streams each chunk instead of spooling it first.
+5. Keep the long `proxy_read_timeout` — encodes can run for hours while the UI holds `/ws`.
+
+```bash
+sudo cp config/nginx/encodelab.conf /etc/nginx/sites-available/encodelab
+# move the `map` block into http {} if this host already has an nginx.conf
+sudo ln -sf /etc/nginx/sites-available/encodelab /etc/nginx/sites-enabled/encodelab
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+If nginx only fronts the UI (`:5173`) and Vite still proxies `/api`, you still need `client_max_body_size 64m` on that server — the browser hits nginx before Vite.
+
+For HTTPS, wrap the same `location` blocks in a `listen 443 ssl` server (certbot / your own certs). Do not lower `client_max_body_size` on the SSL server.
+
 ## Layout
 
 ```
