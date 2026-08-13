@@ -769,7 +769,7 @@
                 </button>
               </div>
             {:else}
-              <button class="btn btn-ghost" onclick={loadNoiseGraph}>Load noise graph</button>
+              <button class="btn btn-ghost" onclick={() => loadNoiseGraph()}>Load noise graph</button>
             {/if}
           </div>
 
