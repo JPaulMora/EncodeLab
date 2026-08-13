@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+frontend/.svelte-kit/
+frontend/build/
+frontend/dist/
+
+# App data (runtime)
+backend/data/encoder.db
+backend/data/encoder.db-*
+backend/data/watch/**
+backend/data/output/**
+backend/data/media/**
+backend/data/uploads/**
+backend/data/logs/**
+!backend/data/**/.gitkeep
+
+# OS / IDE
+.DS_Store
+.env
+.env.local
+*.swp
+.idea/
+.vscode/
+
+# Reference projects (keep locally, do not commit into this app)
+encoder_webui/
+video-comparator/
