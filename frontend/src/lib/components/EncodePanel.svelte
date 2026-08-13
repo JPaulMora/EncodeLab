@@ -12,10 +12,18 @@
   } from '$lib/api';
   import type { EncodeJob, JobSource, LibraryFile, OutputFile } from '$lib/types';
 
+  type PendingUpload = {
+    id: number;
+    file: File;
+    status: 'queued' | 'uploading' | 'error';
+    pct: number;
+    error: string;
+  };
+
   let presets = $state<string[]>([]);
   let presetFormats = $state<Record<string, string>>({});
   let keepTracks = $state(false);
-  let selectedFile = $state<File | null>(null);
+  let pending = $state<PendingUpload[]>([]);
   let wsConnected = $state(false);
   let statusMsg = $state('');
   let statusType = $state<'success' | 'error' | 'info'>('info');
@@ -54,6 +62,10 @@
   let wsBackoff = 1000;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let dragover = $state(false);
+  let pendingId = 0;
+
+  const VIDEO_EXT =
+    /\.(mp4|mkv|avi|mov|m4v|mpg|mpeg|wmv|flv|webm|ts|mts|m2ts)$/i;
 
   function show(msg: string, type: 'success' | 'error' | 'info') {
     statusMsg = msg;
@@ -266,27 +278,85 @@
     refreshLists();
   }
 
-  function pick(f: File) {
-    selectedFile = f;
+  function isVideoFile(f: File): boolean {
+    if (f.type.startsWith('video/')) return true;
+    return VIDEO_EXT.test(f.name);
+  }
+
+  function addFiles(files: FileList | File[]) {
+    const list = Array.from(files).filter(isVideoFile);
+    if (!list.length) {
+      show('No video files in that selection', 'error');
+      return;
+    }
+    const next = [...pending];
+    for (const file of list) {
+      const dup = next.some(
+        (p) => p.file.name === file.name && p.file.size === file.size
+      );
+      if (dup) continue;
+      next.push({
+        id: ++pendingId,
+        file,
+        status: 'queued',
+        pct: 0,
+        error: ''
+      });
+    }
+    pending = next;
     hide();
   }
 
+  function removePending(id: number) {
+    const item = pending.find((p) => p.id === id);
+    if (!item || item.status === 'uploading') return;
+    pending = pending.filter((p) => p.id !== id);
+  }
+
+  function clearPending() {
+    pending = pending.filter((p) => p.status === 'uploading');
+  }
+
+  const queuedCount = $derived(pending.filter((p) => p.status === 'queued').length);
+  const pendingBytes = $derived(
+    pending.filter((p) => p.status !== 'error').reduce((n, p) => n + p.file.size, 0)
+  );
+
   async function upload() {
-    if (!selectedFile) return;
-    const file = selectedFile;
+    if (uploadActive || !queuedCount) return;
     uploadActive = true;
-    uploadName = file.name;
-    uploadPct = 0;
     hide();
+    let ok = 0;
+    let fail = 0;
     try {
-      await uploadLibraryFile(file, (pct) => {
-        uploadPct = pct;
-      });
-      show(`✓ ${file.name} added to library`, 'success');
-      selectedFile = null;
-      await refreshLists();
-    } catch (err) {
-      show(`Upload failed: ${(err as Error).message}`, 'error');
+      while (true) {
+        const item = pending.find((p) => p.status === 'queued');
+        if (!item) break;
+        item.status = 'uploading';
+        item.pct = 0;
+        item.error = '';
+        pending = pending;
+        uploadName = item.file.name;
+        uploadPct = 0;
+        try {
+          await uploadLibraryFile(item.file, (pct) => {
+            item.pct = pct;
+            uploadPct = pct;
+            pending = pending;
+          });
+          ok += 1;
+          pending = pending.filter((p) => p.id !== item.id);
+          await refreshLists();
+        } catch (err) {
+          fail += 1;
+          item.status = 'error';
+          item.error = (err as Error).message;
+          pending = pending;
+        }
+      }
+      if (ok && fail) show(`✓ ${ok} uploaded, ${fail} failed`, 'error');
+      else if (fail) show(`Upload failed: ${pending.find((p) => p.error)?.error || 'error'}`, 'error');
+      else if (ok) show(`✓ ${ok} file${ok === 1 ? '' : 's'} added to library`, 'success');
     } finally {
       uploadActive = false;
     }
@@ -381,7 +451,7 @@
   <div class="panel panel-left">
     <h2 class="side-title">Library upload</h2>
 
-    <label>Drag &amp; Drop or Click to Browse</label>
+    <label>Drag &amp; drop or click to browse</label>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       class="dropzone"
@@ -394,26 +464,71 @@
       ondrop={(e) => {
         e.preventDefault();
         dragover = false;
-        if (e.dataTransfer?.files?.length) pick(e.dataTransfer.files[0]);
+        if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
       }}
     >
       <input
         type="file"
-        accept="video/*,.mkv,.mp4,.avi,.mov,.m4v,.ts,.m2ts,.wmv,.mts"
+        multiple
+        accept="video/*,.mkv,.mp4,.avi,.mov,.m4v,.mpg,.mpeg,.ts,.m2ts,.wmv,.mts,.webm"
         onchange={(e) => {
-          const f = (e.currentTarget as HTMLInputElement).files?.[0];
-          if (f) pick(f);
+          const input = e.currentTarget as HTMLInputElement;
+          if (input.files?.length) addFiles(input.files);
+          input.value = '';
         }}
       />
       <div class="dropzone-icon">📁</div>
       <div class="dropzone-text">
-        {#if selectedFile}
-          <strong>{selectedFile.name}</strong><br />{hsize(selectedFile.size)}
+        {#if pending.length}
+          <strong>{pending.length} video{pending.length === 1 ? '' : 's'} queued</strong><br />
+          drop or click to add more
         {:else}
-          <strong>Drop video here</strong><br />or click to browse
+          <strong>Drop videos here</strong><br />or click to browse
         {/if}
       </div>
     </div>
+
+    {#if pending.length}
+      <div class="pending">
+        <div class="pending-head">
+          <span>Pending · {hsize(pendingBytes)}</span>
+          {#if pending.some((p) => p.status !== 'uploading')}
+            <button type="button" class="btn btn-ghost narrow" onclick={clearPending}>Clear</button>
+          {/if}
+        </div>
+        <ul class="pending-list">
+          {#each pending as p (p.id)}
+            <li class="pending-row" class:error={p.status === 'error'} class:uploading={p.status === 'uploading'}>
+              <div class="pending-body">
+                <div class="pending-name" title={p.file.name}>{p.file.name}</div>
+                <div class="pending-meta">
+                  {#if p.status === 'uploading'}
+                    {p.pct}% · {hsize(p.file.size)}
+                  {:else if p.status === 'error'}
+                    {p.error || 'Failed'}
+                  {:else}
+                    {hsize(p.file.size)}
+                  {/if}
+                </div>
+                {#if p.status === 'uploading'}
+                  <div class="bar-track pending-bar">
+                    <div class="bar-fill bar-upload" style="width:{p.pct}%"></div>
+                  </div>
+                {/if}
+              </div>
+              {#if p.status !== 'uploading'}
+                <button
+                  type="button"
+                  class="del-btn"
+                  aria-label="Remove {p.file.name}"
+                  onclick={() => removePending(p.id)}>✕</button
+                >
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
 
     <div class="progress-container" class:active={uploadActive}>
       <div class="progress-label">
@@ -437,8 +552,14 @@
       <div class="prog-sub">{encSub}</div>
     </div>
 
-    <button class="btn btn-primary" disabled={!selectedFile || uploadActive} onclick={upload}>
-      {selectedFile ? 'Upload to library' : 'Select a file to upload'}
+    <button class="btn btn-primary" disabled={!queuedCount || uploadActive} onclick={upload}>
+      {#if uploadActive}
+        Uploading…
+      {:else if queuedCount}
+        Upload {queuedCount} file{queuedCount === 1 ? '' : 's'}
+      {:else}
+        Select files to upload
+      {/if}
     </button>
 
     {#if statusShow}
@@ -722,6 +843,71 @@
     font-size: 0.85rem;
     color: var(--muted);
     line-height: 1.4;
+  }
+  .pending {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+  }
+  .pending-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.72rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .pending-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 168px;
+    overflow: auto;
+  }
+  .pending-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-2, rgba(255, 255, 255, 0.02));
+  }
+  .pending-row.uploading {
+    border-color: var(--accent);
+  }
+  .pending-row.error {
+    border-color: var(--danger);
+  }
+  .pending-body {
+    flex: 1;
+    min-width: 0;
+  }
+  .pending-name {
+    font-size: 0.75rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pending-meta {
+    font-size: 0.68rem;
+    color: var(--muted);
+    margin-top: 1px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pending-row.error .pending-meta {
+    color: var(--danger);
+  }
+  .pending-bar {
+    margin-top: 4px;
   }
   .progress-container {
     display: none;
