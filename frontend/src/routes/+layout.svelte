@@ -16,7 +16,7 @@
   </nav>
 </header>
 
-{@class="shell">
+<main class="shell">
   {@render children()}
 </main>
 
