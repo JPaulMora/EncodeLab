@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import {
     computePreviewNoiseScore,
+    deleteJob,
     fetchJob,
     fetchJobs,
     fetchPreviewFrame,
@@ -17,6 +18,7 @@
     renderAbsDiff,
     renderOverlay,
     renderSideBySide,
+    renderSubtract,
     urlToFrame
   } from '$lib/client-diff';
   import type { CompareMode, EncodeJob } from '$lib/types';
@@ -31,6 +33,8 @@
   let opacityB = $state(0.5);
   let gain = $state(2);
   let previewUrl = $state<string | null>(null);
+  let incomingUrl = $state<string | null>(null);
+  let incomingSeq = $state(0);
   let absdiffImage = $state<string | null>(null);
   let ssimImage = $state<string | null>(null);
   let mse = $state<number | null>(null);
@@ -72,6 +76,10 @@
   let scoreBusy = $state(false);
   let scoreError = $state('');
   let scoreRequestId = 0;
+  let deletingId = $state<number | null>(null);
+  let previewRequestId = 0;
+  let renderGen = 0;
+  let diffRequestId = 0;
 
   const isPreview = $derived(job?.kind === 'preview' && job?.status === 'preview_ready');
 
@@ -116,12 +124,49 @@
     return parts.join(' · ');
   }
 
+  function isRunning(j: EncodeJob): boolean {
+    return ['queued', 'encoding', 'previewing', 'extracting'].includes(j.status);
+  }
+
+  async function removeJob(j: EncodeJob) {
+    if (isRunning(j) || deletingId != null) return;
+    const extra =
+      j.kind === 'encode' && j.origin !== 'external'
+        ? ' This also deletes the encoded output.'
+        : '';
+    if (!confirm(`Delete “${j.filename}”?${extra}`)) return;
+    deletingId = j.id;
+    error = '';
+    try {
+      await deleteJob(j.id);
+      const idx = jobs.findIndex((x) => x.id === j.id);
+      const remaining = jobs.filter((x) => x.id !== j.id);
+      jobs = remaining;
+      if (selectedId === j.id) {
+        const next = remaining[idx] ?? remaining[Math.max(0, idx - 1)] ?? null;
+        if (next) await selectJob(next.id);
+        else {
+          noiseRequestId += 1;
+          scoreRequestId += 1;
+          selectedId = null;
+          job = null;
+        }
+      }
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      deletingId = null;
+    }
+  }
+
   const currentFrame = $derived(
     job?.frames.find((f) => Math.abs(f.position - position) < 0.01) ?? null
   );
 
   const hasContent = $derived(
-    isPreview ? Boolean(previewSourceUrl && previewDestUrl) : Boolean(currentFrame)
+    isPreview
+      ? Boolean((previewSourceUrl && previewDestUrl) || previewUrl)
+      : Boolean(currentFrame)
   );
 
   const noiseMax = $derived(Math.max(1, noiseScaleMax));
@@ -154,18 +199,18 @@
   }
 
   async function selectJob(id: number) {
-    // Invalidate any in-flight noise work from a previous job
+    // Invalidate any in-flight work from a previous job
     noiseRequestId += 1;
     scoreRequestId += 1;
+    previewRequestId += 1;
+    renderGen += 1;
+    diffRequestId += 1;
     selectedId = id;
     error = '';
-    absdiffImage = null;
-    ssimImage = null;
+    incomingUrl = null;
     mse = null;
     ssim = null;
     psnr = null;
-    previewSourceUrl = null;
-    previewDestUrl = null;
     noiseValues = [];
     noiseBestIndex = null;
     noiseSuggestedOffset = null;
@@ -201,18 +246,24 @@
 
   async function loadPreviewPair() {
     if (!job) return;
+    const jobId = job.id;
+    const req = ++previewRequestId;
     try {
       const r = await fetchPreviewFrame(job.id, frameIndex, frameOffset);
+      if (req !== previewRequestId || selectedId !== jobId) return;
       maxFrames = Math.max(1, r.usable_frame_count - 1);
       frameInput = String(frameIndex);
       sourceOob = r.source_oob;
       sourceShortfall = r.source_shortfall;
       usedFullSource = r.used_full_source;
       rawSourceIndex = r.raw_source_index;
-      previewSourceUrl = `data:image/png;base64,${r.source}`;
-      previewDestUrl = `data:image/png;base64,${r.dest}`;
-      await renderFromUrls(previewSourceUrl, previewDestUrl);
+      const src = `data:image/png;base64,${r.source}`;
+      const dst = `data:image/png;base64,${r.dest}`;
+      previewSourceUrl = src;
+      previewDestUrl = dst;
+      await renderFromUrls(src, dst, req);
     } catch (e) {
+      if (req !== previewRequestId || selectedId !== jobId) return;
       error = (e as Error).message;
     }
   }
@@ -255,28 +306,40 @@
     }
   }
 
-  async function renderFromUrls(src: string, dst: string) {
+  async function renderFromUrls(src: string, dst: string, req = previewRequestId) {
+    const gen = ++renderGen;
     const [a, b] = await Promise.all([urlToFrame(src), urlToFrame(dst)]);
-    if (mode === 'side-by-side') previewUrl = await renderSideBySide(a, b);
-    else if (mode === 'overlay') previewUrl = await renderOverlay(a, b, opacityB);
-    else previewUrl = await renderAbsDiff(a, b, gain);
+    if (gen !== renderGen || req !== previewRequestId) return;
+    let url: string;
+    if (mode === 'side-by-side') url = await renderSideBySide(a, b);
+    else if (mode === 'overlay') url = await renderOverlay(a, b, opacityB);
+    else if (mode === 'subtract') url = await renderSubtract(a, b, gain);
+    else url = await renderAbsDiff(a, b, gain);
+    if (gen !== renderGen || req !== previewRequestId) return;
+    presentPreview(url);
+  }
+
+  function presentPreview(url: string) {
+    if (url === previewUrl) {
+      incomingUrl = null;
+      return;
+    }
+    incomingSeq += 1;
+    incomingUrl = url;
+  }
+
+  function commitIncoming(seq: number) {
+    if (seq !== incomingSeq || !incomingUrl) return;
+    previewUrl = incomingUrl;
+    incomingUrl = null;
   }
 
   async function renderClient() {
-    previewUrl = null;
-    if (isPreview) {
-      if (previewSourceUrl && previewDestUrl) {
-        try {
-          await renderFromUrls(previewSourceUrl, previewDestUrl);
-        } catch (e) {
-          error = (e as Error).message;
-        }
-      }
-      return;
-    }
-    if (!currentFrame?.source_url || !currentFrame?.dest_url) return;
+    const src = isPreview ? previewSourceUrl : currentFrame?.source_url;
+    const dst = isPreview ? previewDestUrl : currentFrame?.dest_url;
+    if (!src || !dst) return;
     try {
-      await renderFromUrls(currentFrame.source_url, currentFrame.dest_url);
+      await renderFromUrls(src, dst);
     } catch (e) {
       error = (e as Error).message;
     }
@@ -287,7 +350,7 @@
     frameIndex = capped;
     frameInput = String(capped);
     await loadPreviewPair();
-    await runDiff();
+    void runDiff();
   }
 
   async function onFrameScrub(v: number) {
@@ -392,6 +455,8 @@
     } else if (!currentFrame?.source_url || !currentFrame?.dest_url) {
       return;
     }
+    const jobId = job.id;
+    const req = ++diffRequestId;
     busy = true;
     error = '';
     try {
@@ -403,15 +468,17 @@
           ? runPreviewDiff(job.id, frameIndex, 'ssim_map', frameOffset)
           : runServerDiff(job.id, position, 'ssim_map')
       ]);
+      if (req !== diffRequestId || selectedId !== jobId) return;
       absdiffImage = `data:image/png;base64,${abs.image}`;
       ssimImage = `data:image/png;base64,${ssimR.image}`;
       mse = abs.mse;
       ssim = abs.ssim;
       psnr = abs.psnr;
     } catch (e) {
+      if (req !== diffRequestId || selectedId !== jobId) return;
       error = (e as Error).message;
     } finally {
-      busy = false;
+      if (req === diffRequestId) busy = false;
     }
   }
 
@@ -454,8 +521,6 @@
     void gain;
     void position;
     void currentFrame;
-    void previewSourceUrl;
-    void previewDestUrl;
     renderClient();
   });
 
@@ -502,33 +567,60 @@
       {#if !jobs.length}
         <div class="empty">No jobs yet</div>
       {:else}
-        {#each jobs as j}
-          <button
-            class="job-item"
-            class:active={selectedId === j.id}
-            onclick={() => selectJob(j.id)}
-          >
-            <div class="job-item-main">
-              <div class="job-name" title={j.filename}>{truncate(j.filename, 30)}</div>
-              <div class="job-meta" title={jobMetaLine(j)}>{truncate(jobMetaLine(j), 100)}</div>
+        {#each jobs as j (j.id)}
+          <div class="job-item" class:active={selectedId === j.id}>
+            <button type="button" class="job-item-select" onclick={() => selectJob(j.id)}>
+              <div class="job-item-main">
+                <div class="job-name" title={j.filename}>{truncate(j.filename, 30)}</div>
+                <div class="job-meta" title={jobMetaLine(j)}>{truncate(jobMetaLine(j), 100)}</div>
+              </div>
+              <table class="job-stats">
+                <tbody>
+                  <tr>
+                    <th>Compression</th>
+                    <td>{formatCompression(j)}</td>
+                  </tr>
+                  <tr>
+                    <th>Noise</th>
+                    <td>{formatNoise(j)}</td>
+                  </tr>
+                  <tr>
+                    <th>Encode</th>
+                    <td>{formatDuration(j.encode_duration_seconds)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </button>
+            <div class="job-item-actions">
+              <button
+                type="button"
+                class="job-del"
+                aria-label="Delete compare run {j.filename}"
+                title={isRunning(j) ? 'Cancel the running job first' : 'Delete compare run'}
+                disabled={isRunning(j) || deletingId === j.id}
+                onclick={() => removeJob(j)}
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                  <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  <line x1="10" y1="11" x2="10" y2="17" />
+                  <line x1="14" y1="11" x2="14" y2="17" />
+                </svg>
+              </button>
             </div>
-            <table class="job-stats">
-              <tbody>
-                <tr>
-                  <th>Compression</th>
-                  <td>{formatCompression(j)}</td>
-                </tr>
-                <tr>
-                  <th>Noise</th>
-                  <td>{formatNoise(j)}</td>
-                </tr>
-                <tr>
-                  <th>Encode</th>
-                  <td>{formatDuration(j.encode_duration_seconds)}</td>
-                </tr>
-              </tbody>
-            </table>
-          </button>
+          </div>
         {/each}
       {/if}
     </div>
@@ -550,7 +642,7 @@
           {#if job.error}<br /><small>{job.error}</small>{/if}
         {/if}
       </div>
-    {:else if isPreview && !previewSourceUrl}
+    {:else if isPreview && !previewSourceUrl && !previewUrl}
       <div class="empty big">
         {#if job.status === 'previewing' || job.status === 'queued'}
           Waiting for preview ({job.status})…
@@ -798,6 +890,11 @@
             class:active={mode === 'abs-diff'}
             onclick={() => (mode = 'abs-diff')}>Abs diff</button
           >
+          <button
+            class="btn btn-ghost"
+            class:active={mode === 'subtract'}
+            onclick={() => (mode = 'subtract')}>Subtract</button
+          >
         </div>
       </div>
 
@@ -808,27 +905,45 @@
           {opacityB.toFixed(2)}
         </label>
       {/if}
-      {#if mode === 'abs-diff'}
+      {#if mode === 'abs-diff' || mode === 'subtract'}
         <label class="slider"
-          >Gain
+          >{mode === 'subtract' ? 'Subtract gain' : 'Gain'}
           <input type="range" min="1" max="8" step="0.5" bind:value={gain} />
           {gain}
         </label>
       {/if}
 
-      <div class="preview checker">
+      <div class="preview checker" aria-busy={incomingUrl != null}>
         {#if previewUrl}
-          <img src={previewUrl} alt="Comparison" />
+          <img class="preview-img" src={previewUrl} alt="Comparison" />
+        {/if}
+        {#if incomingUrl}
+          {#key incomingSeq}
+            {@const seq = incomingSeq}
+            <img
+              class="preview-img"
+              class:incoming={previewUrl != null}
+              src={incomingUrl}
+              alt={previewUrl ? '' : 'Comparison'}
+              onload={() => commitIncoming(seq)}
+              onerror={() => commitIncoming(seq)}
+            />
+          {/key}
+        {/if}
+        {#if previewUrl || incomingUrl}
           <button
             class="btn btn-ghost dl"
             onclick={() =>
               downloadDataUrl(
-                previewUrl!,
+                incomingUrl ?? previewUrl!,
                 isPreview ? `preview-${frameIndex}.png` : `compare-${position}.png`
               )}>Download</button
           >
         {:else}
           <div class="empty">Rendering…</div>
+        {/if}
+        {#if previewUrl && incomingUrl}
+          <div class="preview-pending" aria-live="polite">Loading frame…</div>
         {/if}
       </div>
 
@@ -934,23 +1049,87 @@
   }
   .job-item {
     display: flex;
-    gap: 10px;
+    gap: 4px;
     align-items: flex-start;
-    text-align: left;
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 10px 12px;
+    padding: 8px 6px 8px 12px;
     color: var(--text);
-    cursor: pointer;
   }
   .job-item.active {
     border-color: var(--accent);
     background: rgba(108, 99, 255, 0.1);
   }
+  .job-item-select {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    text-align: left;
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 2px 0;
+  }
+  .job-item-select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
   .job-item-main {
     flex: 1;
     min-width: 0;
+  }
+  .job-item-actions {
+    flex: 0 0 32px;
+    display: flex;
+    align-items: flex-start;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms ease;
+  }
+  .job-item:hover .job-item-actions,
+  .job-item:focus-within .job-item-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .job-del {
+    width: 32px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .job-del:hover,
+  .job-del:focus-visible {
+    color: var(--danger);
+    background: rgba(239, 68, 68, 0.12);
+  }
+  .job-del:focus-visible {
+    outline: 2px solid var(--danger);
+    outline-offset: 1px;
+  }
+  .job-del:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  @media (hover: none) {
+    .job-item-actions {
+      opacity: 1;
+      pointer-events: auto;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .job-item-actions {
+      transition: none;
+    }
   }
   .job-name {
     font-size: 13px;
@@ -1214,10 +1393,31 @@
       -10px 0;
     background-color: #0a0c12;
   }
-  .preview img {
+  .preview-img {
     display: block;
     max-width: 100%;
     margin: 0 auto;
+  }
+  .preview-img.incoming {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    transform: translateX(-50%);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .preview-pending {
+    position: absolute;
+    left: 8px;
+    top: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    background: rgba(15, 17, 23, 0.72);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    pointer-events: none;
   }
   .preview .dl {
     position: absolute;
