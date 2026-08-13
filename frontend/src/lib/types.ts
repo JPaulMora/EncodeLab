@@ -38,6 +38,7 @@ export type EncodeJob = {
   noise_mse_std: number | null;
   noise_frame_count: number | null;
   encode_duration_seconds: number | null;
+  keep_tracks: boolean;
   frames: JobFrame[];
   created_at: string | null;
   updated_at?: string | null;

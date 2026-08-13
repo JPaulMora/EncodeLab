@@ -13,6 +13,8 @@
   import type { EncodeJob, JobSource, LibraryFile, OutputFile } from '$lib/types';
 
   let presets = $state<string[]>([]);
+  let presetFormats = $state<Record<string, string>>({});
+  let keepTracks = $state(false);
   let selectedFile = $state<File | null>(null);
   let wsConnected = $state(false);
   let statusMsg = $state('');
@@ -76,6 +78,18 @@
   function presetFor(key: string) {
     return rowPreset[key] || presets[0] || '';
   }
+
+  function formatFor(preset: string): string {
+    return presetFormats[preset] || '';
+  }
+
+  function mp4TrackWarning(preset: string): string | undefined {
+    if (!keepTracks || formatFor(preset) !== 'mp4') return undefined;
+    return 'MP4 can keep extra AAC/AC3 audio, but bitmap subtitles (PGS, DVD) and some codecs (DTS, TrueHD, FLAC) usually cannot be stored as extra tracks and may be skipped. Use an MKV preset to keep them.';
+  }
+
+  const mkvPresets = $derived(presets.filter((p) => formatFor(p) === 'mkv'));
+  const mp4Presets = $derived(presets.filter((p) => formatFor(p) === 'mp4'));
 
   function setPreset(key: string, value: string) {
     rowPreset = { ...rowPreset, [key]: value };
@@ -209,8 +223,10 @@
     try {
       const d = await (await fetch('/api/presets')).json();
       presets = d.presets || [];
+      presetFormats = d.formats || {};
     } catch {
       presets = [];
+      presetFormats = {};
     }
   }
 
@@ -284,11 +300,11 @@
     }
     busyKey = key + kind;
     try {
-      const job = await createJob(source, preset, kind);
+      const job = await createJob(source, preset, kind, keepTracks);
       show(
         kind === 'preview'
           ? `Preview queued (#${job.id}) with [${preset}]`
-          : `Encode queued (#${job.id}) with [${preset}]`,
+          : `Encode queued (#${job.id}) with [${preset}]${keepTracks ? ' · extra tracks' : ''}`,
         'success'
       );
       await refreshLists();
@@ -471,6 +487,9 @@
                 </div>
                 <div class="fi-meta">
                   #{j.id} · {j.preset} · {j.source_label}
+                  {#if j.keep_tracks}
+                    · extra tracks
+                  {/if}
                   {#if j.progress}
                     · {j.progress.toFixed(0)}%
                   {/if}
@@ -502,6 +521,27 @@
       </div>
     {/if}
 
+    <div class="section encode-opts">
+      <label class="keep-tracks">
+        <input type="checkbox" bind:checked={keepTracks} />
+        Keep extra audio &amp; subtitles
+      </label>
+      {#if keepTracks}
+        <p class="tracks-warn">
+          {#if mkvPresets.length}
+            <strong>MKV</strong> ({mkvPresets.join(', ')}) can keep extra audio and subtitle
+            tracks.
+          {/if}
+          {#if mp4Presets.length}
+            {' '}
+            <strong>MP4</strong> ({mp4Presets.join(', ')}) can keep extra AAC/AC3 audio, but
+            bitmap subtitles (PGS, DVD) and some codecs (DTS, TrueHD, FLAC) usually cannot be
+            stored as extra tracks and may be skipped.
+          {/if}
+        </p>
+      {/if}
+    </div>
+
     <div class="section">
       <div class="section-hdr"><h2>Library</h2></div>
       <div class="file-list">
@@ -518,22 +558,29 @@
               <div class="fi-actions">
                 <select
                   class="preset-mini"
+                  class:preset-warn={keepTracks && formatFor(presetFor(key)) === 'mp4'}
                   value={presetFor(key)}
+                  title={mp4TrackWarning(presetFor(key)) ?? undefined}
                   onchange={(e) => setPreset(key, (e.currentTarget as HTMLSelectElement).value)}
                 >
                   {#each presets as p}
                     <option value={p}>{p}</option>
                   {/each}
                 </select>
+                {#if keepTracks && formatFor(presetFor(key)) === 'mp4'}
+                  <span class="tracks-row-warn" title={mp4TrackWarning(presetFor(key))}>MP4</span>
+                {/if}
                 <button
                   class="btn btn-ghost narrow"
                   disabled={busyKey === key + 'encode'}
+                  title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'library', id: f.id }, 'encode', key)}
                   >Encode</button
                 >
                 <button
                   class="btn btn-ghost narrow"
                   disabled={busyKey === key + 'preview'}
+                  title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'library', id: f.id }, 'preview', key)}
                   >Preview</button
                 >
@@ -574,22 +621,29 @@
               <div class="fi-actions">
                 <select
                   class="preset-mini"
+                  class:preset-warn={keepTracks && formatFor(presetFor(key)) === 'mp4'}
                   value={presetFor(key)}
+                  title={mp4TrackWarning(presetFor(key)) ?? undefined}
                   onchange={(e) => setPreset(key, (e.currentTarget as HTMLSelectElement).value)}
                 >
                   {#each presets as p}
                     <option value={p}>{p}</option>
                   {/each}
                 </select>
+                {#if keepTracks && formatFor(presetFor(key)) === 'mp4'}
+                  <span class="tracks-row-warn" title={mp4TrackWarning(presetFor(key))}>MP4</span>
+                {/if}
                 <button
                   class="btn btn-ghost narrow"
                   disabled={busyKey === key + 'encode'}
+                  title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'job', id: f.job_id }, 'encode', key)}
                   >Encode</button
                 >
                 <button
                   class="btn btn-ghost narrow"
                   disabled={busyKey === key + 'preview'}
+                  title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'job', id: f.job_id }, 'preview', key)}
                   >Preview</button
                 >
@@ -875,6 +929,44 @@
     border: 1px solid var(--border);
     background: transparent;
     color: inherit;
+  }
+  .preset-mini.preset-warn {
+    border-color: var(--warn, #f59e0b);
+  }
+  .encode-opts {
+    padding-bottom: 2px;
+  }
+  .keep-tracks {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--text);
+    text-transform: none;
+    letter-spacing: 0;
+    cursor: pointer;
+    user-select: none;
+  }
+  .keep-tracks input {
+    margin: 0;
+    accent-color: var(--accent);
+  }
+  .tracks-warn {
+    margin: 8px 0 0;
+    font-size: 0.75rem;
+    line-height: 1.45;
+    color: var(--warn, #f59e0b);
+  }
+  .tracks-row-warn {
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--warn, #f59e0b);
+    border: 1px solid var(--warn, #f59e0b);
+    border-radius: 4px;
+    padding: 1px 4px;
+    cursor: help;
   }
   .dl-btn,
   .del-btn {

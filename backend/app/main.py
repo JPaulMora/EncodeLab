@@ -265,6 +265,7 @@ def job_to_dict(job: EncodeJob, db=None) -> dict:
             "noise_mse_std": job.noise_mse_std,
             "noise_frame_count": job.noise_frame_count,
             "encode_duration_seconds": job.encode_duration_seconds,
+            "keep_tracks": bool(job.keep_tracks),
             "created_at": job.created_at.isoformat() if job.created_at else None,
             "updated_at": job.updated_at.isoformat() if job.updated_at else None,
             "frames": [
@@ -313,7 +314,8 @@ async def get_presets():
         on_disk = sorted(d.name for d in WATCH_BASE.iterdir() if d.is_dir())
         if on_disk:
             presets = on_disk
-    return JSONResponse({"presets": presets})
+    formats = {k: PRESET_MAP[k][1] for k in PRESET_MAP}
+    return JSONResponse({"presets": presets, "formats": formats})
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────
@@ -477,6 +479,7 @@ class CreateJobBody(BaseModel):
     source: JobSource
     preset: str
     kind: str = Field(default="encode")  # encode | preview
+    keep_tracks: bool = False
 
 
 @app.post("/api/jobs")
@@ -535,6 +538,7 @@ async def create_job(body: CreateJobBody, background_tasks: BackgroundTasks):
             source_path=str(real_source),
             library_file_id=library_file_id,
             parent_job_id=parent_job_id,
+            keep_tracks=body.keep_tracks,
         )
         db.add(job)
         db.commit()

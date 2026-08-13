@@ -36,12 +36,13 @@ export async function fetchOutputs(): Promise<OutputFile[]> {
 export async function createJob(
   source: JobSource,
   preset: string,
-  kind: 'encode' | 'preview' = 'encode'
+  kind: 'encode' | 'preview' = 'encode',
+  keepTracks = false
 ): Promise<EncodeJob> {
   const r = await fetch('/api/jobs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source, preset, kind })
+    body: JSON.stringify({ source, preset, kind, keep_tracks: keepTracks })
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));

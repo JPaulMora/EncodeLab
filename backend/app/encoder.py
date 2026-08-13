@@ -102,6 +102,13 @@ def _handbrake_import_args(preset_name: str) -> list[str]:
     return []
 
 
+def _keep_tracks_args(keep: bool) -> list[str]:
+    """Override preset track selection so extra audio/subs are muxed, not burned."""
+    if not keep:
+        return []
+    return ["--all-audio", "--all-subtitles", "--subtitle-burned", "none"]
+
+
 def _resolve_job_for_ticket(
     db,
     folder: str,
@@ -274,12 +281,13 @@ async def run_encode(folder: str, infile_path: Path, job_id: int | None = None) 
         _current_encode_path = str(out_path)
 
         log.info(
-            "ENCODING [%s] job=%s %s -> %s (preset: %s)",
+            "ENCODING [%s] job=%s %s -> %s (preset: %s keep_tracks=%s)",
             folder,
             job_id,
             display,
             out_name,
             preset,
+            bool(job.keep_tracks),
         )
 
         import_args = _handbrake_import_args(preset)
@@ -293,6 +301,7 @@ async def run_encode(folder: str, infile_path: Path, job_id: int | None = None) 
             "-o",
             str(out_path),
             *extra_args,
+            *_keep_tracks_args(bool(job.keep_tracks)),
         ]
 
         proc = await asyncio.create_subprocess_exec(
@@ -481,6 +490,7 @@ async def run_preview(job_id: int) -> None:
             "--stop-at",
             f"duration:{hb_length}",
             *extra_args,
+            *_keep_tracks_args(bool(job.keep_tracks)),
         ]
 
         log.info(

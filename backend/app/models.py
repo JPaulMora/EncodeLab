@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -70,6 +70,9 @@ class EncodeJob(Base):
     noise_mse_std: Mapped[float | None] = mapped_column(Float, nullable=True)
     noise_frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     encode_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    keep_tracks: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
