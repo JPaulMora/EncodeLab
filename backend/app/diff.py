@@ -49,6 +49,13 @@ def compute_mse(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean((a_f - b_f) ** 2))
 
 
+def compute_psnr(mse: float, max_value: float = 255.0) -> float:
+    """Peak signal-to-noise ratio in dB from MSE (8-bit → max 255)."""
+    if mse <= 0:
+        return float("inf")
+    return float(10.0 * np.log10((max_value * max_value) / mse))
+
+
 def compute_ssim(a: np.ndarray, b: np.ndarray) -> float:
     gray_a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
@@ -84,6 +91,7 @@ def compare_frame_files(
 
     mse = compute_mse(a, b)
     ssim_score = compute_ssim(a, b)
+    psnr = compute_psnr(mse)
 
     if mode == "ssim_map":
         result = ssim_disparity_map(a, b)
@@ -94,4 +102,5 @@ def compare_frame_files(
         "image": encode_image_b64(result),
         "mse": mse,
         "ssim": ssim_score,
+        "psnr": psnr if psnr != float("inf") else None,
     }

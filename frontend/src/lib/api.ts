@@ -17,7 +17,7 @@ export async function runServerDiff(
   jobId: number,
   position: number,
   mode: ServerDiffMode
-): Promise<{ image: string; mse: number; ssim: number }> {
+): Promise<{ image: string; mse: number; ssim: number; psnr: number | null }> {
   const params = new URLSearchParams({
     position: String(position),
     mode

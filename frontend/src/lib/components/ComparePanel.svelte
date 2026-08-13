@@ -25,6 +25,7 @@
   let serverImage = $state<string | null>(null);
   let mse = $state<number | null>(null);
   let ssim = $state<number | null>(null);
+  let psnr = $state<number | null>(null);
   let busy = $state(false);
   let error = $state('');
   let showExternal = $state(false);
@@ -54,6 +55,7 @@
     serverImage = null;
     mse = null;
     ssim = null;
+    psnr = null;
     job = await fetchJob(id);
     if (job.frames.length) {
       const hasPos = job.frames.some((f) => Math.abs(f.position - position) < 0.01);
@@ -87,6 +89,7 @@
       serverImage = `data:image/png;base64,${r.image}`;
       mse = r.mse;
       ssim = r.ssim;
+      psnr = r.psnr;
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -294,7 +297,14 @@
           </button>
         </div>
         {#if mse != null && ssim != null}
-          <div class="metrics">MSE {mse.toFixed(2)} · SSIM {ssim.toFixed(4)}</div>
+          <div class="metrics">
+            <div class="metric"><span class="metric-label">SSIM</span> {ssim.toFixed(4)}</div>
+            <div class="metric">
+              <span class="metric-label">PSNR</span>
+              {psnr != null ? `${psnr.toFixed(2)} dB` : '∞'}
+            </div>
+            <div class="metric"><span class="metric-label">MSE</span> {mse.toFixed(2)}</div>
+          </div>
         {/if}
         {#if serverImage}
           <div class="preview">
@@ -474,9 +484,21 @@
     padding-top: 16px;
   }
   .metrics {
-    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 14px 0;
+    font-size: 18px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    line-height: 1.35;
+  }
+  .metric-label {
+    display: inline-block;
+    min-width: 4.5em;
     color: var(--accent2);
-    margin: 10px 0;
+    font-weight: 700;
   }
   .empty {
     text-align: center;
