@@ -27,6 +27,12 @@ from app.config import (
 log = logging.getLogger(__name__)
 
 
+def _console(msg: str) -> None:
+    """Always print to stdout so Docker compose shows progress."""
+    print(msg, flush=True)
+    log.info(msg)
+
+
 def _require_ffmpeg() -> str:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -427,7 +433,7 @@ def compute_match_noise_graph(
     (source clip starts `pad` frames before dest usable content).
     """
     t0 = time.perf_counter()
-    log.info("match-noise: probe %s / %s", source_clip.name, dest_clip.name)
+    _console(f"match-noise: probe {source_clip.name} / {dest_clip.name}")
     src_meta = probe_video(source_clip)
     dst_meta = probe_video(dest_clip)
     src_fps = src_meta["fps"] or 30.0
@@ -442,12 +448,9 @@ def compute_match_noise_graph(
     source_center_idx = max(0, (src_frame_count - 1) // 2)
     source_center_t = source_center_idx / src_fps
 
-    log.info(
-        "match-noise: usable_frames=%s start=%.2fs center_idx=%s (probe %.1fs)",
-        usable_frames,
-        usable_start,
-        source_center_idx,
-        time.perf_counter() - t0,
+    _console(
+        f"match-noise: usable_frames={usable_frames} start={usable_start:.2f}s "
+        f"center_idx={source_center_idx} (probe {time.perf_counter() - t0:.1f}s)"
     )
 
     t_center = time.perf_counter()
@@ -457,7 +460,7 @@ def compute_match_noise_graph(
     if src_bgr is None:
         raise ValueError("Could not decode source center frame")
     src_g = _gray_small_bgr(src_bgr)
-    log.info("match-noise: source center extracted (%.1fs)", time.perf_counter() - t_center)
+    _console(f"match-noise: source center extracted ({time.perf_counter() - t_center:.1f}s)")
 
     values: list[float] = []
     consecutive: list[float] = []
@@ -518,12 +521,9 @@ def compute_match_noise_graph(
                 rate = (i + 1) / elapsed if elapsed > 0 else 0
                 remaining = usable_frames - (i + 1)
                 eta = remaining / rate if rate > 0 else 0
-                log.info(
-                    "match-noise: %s/%s frames (%.0f fps, ~%.0fs left)",
-                    i + 1,
-                    usable_frames,
-                    rate,
-                    eta,
+                _console(
+                    f"match-noise: {i + 1}/{usable_frames} frames "
+                    f"({rate:.0f} fps, ~{eta:.0f}s left)"
                 )
     finally:
         cap.release()
@@ -551,15 +551,10 @@ def compute_match_noise_graph(
     sel_vals = [v for _, v in finite_sel]
     scale_max = float(max(sel_vals)) if sel_vals else float(best_mse)
 
-    log.info(
-        "match-noise: done best=%s mse=%.1f offset=%s cuts=%s window=[%s,%s] (%.1fs total)",
-        best_index,
-        best_mse,
-        suggested_offset,
-        scene_cuts,
-        sel_start,
-        sel_end,
-        time.perf_counter() - t0,
+    _console(
+        f"match-noise: done best={best_index} mse={best_mse:.1f} "
+        f"offset={suggested_offset} cuts={scene_cuts} "
+        f"window=[{sel_start},{sel_end}] ({time.perf_counter() - t0:.1f}s total)"
     )
 
     return {
@@ -699,13 +694,9 @@ def compute_preview_noise_score(
         step = (n - 1) / (max_frames - 1)
         indices = sorted({int(round(i * step)) for i in range(max_frames)})
 
-    log.info(
-        "noise-score: scoring %s/%s frames offset=%s src=%s dest=%s",
-        len(indices),
-        n,
-        offset,
-        source_clip.name,
-        dest_clip.name,
+    _console(
+        f"noise-score: scoring {len(indices)}/{n} frames offset={offset} "
+        f"src={source_clip.name} dest={dest_clip.name}"
     )
 
     ssims: list[float] = []
@@ -744,14 +735,9 @@ def compute_preview_noise_score(
             rate = done / elapsed if elapsed > 0 else 0
             remaining = len(indices) - done
             eta = remaining / rate if rate > 0 else 0
-            log.info(
-                "noise-score: %s/%s sampled (ok=%s skip=%s, %.1f/s, ~%.0fs left)",
-                done,
-                len(indices),
-                len(ssims),
-                skipped,
-                rate,
-                eta,
+            _console(
+                f"noise-score: {done}/{len(indices)} sampled "
+                f"(ok={len(ssims)} skip={skipped}, {rate:.1f}/s, ~{eta:.0f}s left)"
             )
 
     if not ssims:
@@ -770,15 +756,11 @@ def compute_preview_noise_score(
     else:
         psnr_mean, psnr_std = None, None
 
-    log.info(
-        "noise-score: done ssim=%.4f±%.4f psnr=%s mse=%.2f n=%s skip=%s (%.1fs)",
-        ssim_mean,
-        ssim_std,
-        f"{psnr_mean:.2f}" if psnr_mean is not None else "—",
-        mse_mean,
-        len(ssims),
-        skipped,
-        time.perf_counter() - t0,
+    psnr_s = f"{psnr_mean:.2f}" if psnr_mean is not None else "—"
+    _console(
+        f"noise-score: done ssim={ssim_mean:.4f}±{ssim_std:.4f} "
+        f"psnr={psnr_s} mse={mse_mean:.2f} n={len(ssims)} skip={skipped} "
+        f"({time.perf_counter() - t0:.1f}s)"
     )
 
     return {
