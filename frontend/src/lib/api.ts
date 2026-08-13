@@ -50,6 +50,14 @@ export async function createJob(
   return r.json();
 }
 
+export async function deleteJob(id: number): Promise<void> {
+  const r = await fetch(`/api/jobs/${id}`, { method: 'DELETE' });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || 'Delete failed');
+  }
+}
+
 export async function cancelJob(id: number): Promise<void> {
   const r = await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' });
   if (!r.ok) {

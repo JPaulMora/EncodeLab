@@ -154,6 +154,43 @@ def _media_url(path: str | None) -> str | None:
         return None
 
 
+def _unlink_under(path: str | Path | None, base: Path) -> None:
+    if not path:
+        return
+    fp = Path(path)
+    if not is_under(fp, base):
+        return
+    try:
+        if fp.is_dir() and not fp.is_symlink():
+            shutil.rmtree(fp, ignore_errors=True)
+        elif fp.exists() or fp.is_symlink():
+            fp.unlink(missing_ok=True)
+    except OSError:
+        log.warning("Could not remove %s", fp, exc_info=True)
+
+
+def _cleanup_job_files(job: EncodeJob) -> None:
+    """Remove job-owned compare artifacts. Never touch library originals."""
+    job_dir = MEDIA_BASE / "jobs" / str(job.id)
+    _unlink_under(job_dir, MEDIA_BASE)
+
+    if job.origin == "external":
+        _unlink_under(job.source_path, UPLOAD_TMP)
+        _unlink_under(job.dest_path, UPLOAD_TMP)
+        if job.source_path:
+            parent = Path(job.source_path).parent
+            ext_root = UPLOAD_TMP / "external"
+            if is_under(parent, ext_root):
+                _unlink_under(parent, UPLOAD_TMP)
+    elif job.kind == "encode" and job.dest_path:
+        _unlink_under(job.dest_path, OUTPUT_BASE)
+
+    if job.kind == "encode" and job.source_path and job.preset in PRESET_MAP:
+        suffix = Path(job.source_path).suffix
+        ticket = WATCH_BASE / job.preset / ticket_name_for_job(job.id, suffix)
+        unlink_watch_ticket(ticket, WATCH_BASE)
+
+
 def _source_label(job: EncodeJob, db) -> str:
     if job.library_file_id:
         lib = job.library_file or db.get(LibraryFile, job.library_file_id)
@@ -1099,6 +1136,41 @@ async def get_job(job_id: int):
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return JSONResponse(job_to_dict(job, db))
+    finally:
+        db.close()
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: int):
+    db = SessionLocal()
+    try:
+        job = db.get(EncodeJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if job.status in ("queued", "encoding", "previewing", "extracting"):
+            raise HTTPException(
+                status_code=409,
+                detail="Job is still running — cancel it first",
+            )
+        if get_current_job_id() == job_id:
+            raise HTTPException(status_code=409, detail="Job is currently encoding")
+
+        children = (
+            db.query(EncodeJob).filter(EncodeJob.parent_job_id == job_id).count()
+        )
+        if children:
+            raise HTTPException(
+                status_code=409,
+                detail="Job is the source of another encode",
+            )
+
+        _cleanup_job_files(job)
+        db.delete(job)
+        db.commit()
+        await broadcast_watch_update()
+        await manager.broadcast({"type": "job_deleted", "job_id": job_id})
+        return JSONResponse({"status": "deleted", "job_id": job_id})
     finally:
         db.close()
 

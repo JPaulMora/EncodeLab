@@ -146,6 +146,9 @@
           goto(`/compare?job=${msg.job_id}`);
         }
         break;
+      case 'job_deleted':
+        refreshLists();
+        break;
       case 'encode_failed':
         encodeFlash = 'red';
         encSub = 'Failed';
