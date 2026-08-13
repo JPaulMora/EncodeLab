@@ -18,6 +18,7 @@ services:
     volumes:
       - ./frontend/src:/app/src
       - ./frontend/static:/app/static
+      - ./frontend/vite.config.ts:/app/vite.config.ts:ro
     environment:
       # Browser hits host-mapped API; Vite proxy inside container uses this
       VITE_API_PROXY: http://api:8000
