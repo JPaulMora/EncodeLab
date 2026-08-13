@@ -56,6 +56,19 @@ async def run_encode(folder: str, infile_path: Path, job_id: int | None = None) 
         if job_id is not None:
             job = db.get(EncodeJob, job_id)
         if job is None:
+            # Reuse queued job created at upload time (match source path or filename+preset)
+            job = (
+                db.query(EncodeJob)
+                .filter(
+                    EncodeJob.origin == "encode",
+                    EncodeJob.status.in_(("queued", "encoding")),
+                    EncodeJob.filename == infile_path.name,
+                    EncodeJob.preset == folder,
+                )
+                .order_by(EncodeJob.id.desc())
+                .first()
+            )
+        if job is None:
             job = EncodeJob(
                 filename=infile_path.name,
                 preset=folder,
