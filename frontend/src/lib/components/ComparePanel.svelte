@@ -64,12 +64,14 @@
   let noiseSuggestedOffset = $state<number | null>(null);
   let noiseBusy = $state(false);
   let noiseError = $state('');
+  let noiseRequestId = 0;
   let sceneCuts = $state<number[]>([]);
   let selectionStart = $state(0);
   let selectionEnd = $state(0);
   let noiseScaleMax = $state(1);
   let scoreBusy = $state(false);
   let scoreError = $state('');
+  let scoreRequestId = 0;
 
   const isPreview = $derived(job?.kind === 'preview' && job?.status === 'preview_ready');
 
@@ -152,6 +154,9 @@
   }
 
   async function selectJob(id: number) {
+    // Invalidate any in-flight noise work from a previous job
+    noiseRequestId += 1;
+    scoreRequestId += 1;
     selectedId = id;
     error = '';
     absdiffImage = null;
@@ -165,6 +170,9 @@
     noiseBestIndex = null;
     noiseSuggestedOffset = null;
     noiseError = '';
+    noiseBusy = false;
+    scoreBusy = false;
+    scoreError = '';
     sceneCuts = [];
     selectionStart = 0;
     selectionEnd = 0;
@@ -179,18 +187,15 @@
     frameIndex = 0;
     frameInput = '0';
     if (job.kind === 'preview' && job.status === 'preview_ready') {
-      await loadNoiseGraph();
-      if (noiseBestIndex != null) {
-        frameIndex = noiseBestIndex;
-        frameInput = String(noiseBestIndex);
-      }
+      // Show frames immediately; noise graph/score run in the background
       await loadPreviewPair();
-      await runDiff();
+      void runDiff();
+      void loadNoiseGraph({ autoJump: true });
     } else if (job.frames.length) {
       const hasPos = job.frames.some((f) => Math.abs(f.position - position) < 0.01);
       if (!hasPos) position = job.frames[0].position;
       await renderClient();
-      await runDiff();
+      void runDiff();
     }
   }
 
@@ -212,12 +217,18 @@
     }
   }
 
-  async function loadNoiseGraph() {
+  async function loadNoiseGraph(opts: { autoJump?: boolean } = {}) {
     if (!job) return;
+    const jobId = job.id;
+    const req = ++noiseRequestId;
+    const startFrame = frameIndex;
+    const startOffset = frameOffset;
     noiseBusy = true;
     noiseError = '';
     try {
-      const r = await fetchPreviewNoise(job.id);
+      const r = await fetchPreviewNoise(jobId);
+      if (req !== noiseRequestId || selectedId !== jobId) return;
+
       noiseValues = r.values;
       noiseBestIndex = r.best_index;
       noiseSuggestedOffset = r.suggested_offset;
@@ -226,15 +237,21 @@
       selectionEnd = r.selection_end ?? Math.max(0, r.frame_count - 1);
       noiseScaleMax = r.scale_max || 1;
       maxFrames = Math.max(maxFrames, r.frame_count - 1);
-      if (!offsetLocked && r.suggested_offset != null) {
+
+      const stillAtStart = frameIndex === startFrame && frameOffset === startOffset;
+      if (!offsetLocked && r.suggested_offset != null && stillAtStart) {
         frameOffset = r.suggested_offset;
         offsetInput = String(r.suggested_offset);
       }
+      if (opts.autoJump && stillAtStart && r.best_index != null) {
+        await goToFrame(r.best_index);
+      }
     } catch (e) {
+      if (req !== noiseRequestId || selectedId !== jobId) return;
       noiseError = (e as Error).message;
       noiseValues = [];
     } finally {
-      noiseBusy = false;
+      if (req === noiseRequestId) noiseBusy = false;
     }
   }
 
@@ -325,16 +342,20 @@
 
   async function runNoiseScore() {
     if (!job || !isPreview) return;
+    const jobId = job.id;
+    const req = ++scoreRequestId;
     scoreBusy = true;
     scoreError = '';
     try {
-      const r = await computePreviewNoiseScore(job.id, frameOffset);
+      const r = await computePreviewNoiseScore(jobId, frameOffset);
+      if (req !== scoreRequestId || selectedId !== jobId) return;
       job = r.job;
       jobs = jobs.map((j) => (j.id === r.job.id ? r.job : j));
     } catch (e) {
+      if (req !== scoreRequestId || selectedId !== jobId) return;
       scoreError = (e as Error).message;
     } finally {
-      scoreBusy = false;
+      if (req === scoreRequestId) scoreBusy = false;
     }
   }
 
