@@ -9,10 +9,20 @@ DATA_DIR = Path(os.environ.get("ENCODER_DATA_DIR", BASE_DIR / "data")).resolve()
 
 WATCH_BASE = DATA_DIR / "watch"
 OUTPUT_BASE = DATA_DIR / "output"
+LIBRARY_BASE = DATA_DIR / "library"
 MEDIA_BASE = DATA_DIR / "media"
 UPLOAD_TMP = DATA_DIR / "uploads"
 LOG_FILE = DATA_DIR / "logs" / "encoder.log"
 DB_PATH = DATA_DIR / "encoder.db"
+
+# Preview encode window (seconds around 25% of timeline)
+PREVIEW_LEAD_IN = 2.0
+PREVIEW_WINDOW = 8.0
+PREVIEW_WARMUP = 2.0
+PREVIEW_PAD_FRAMES = 12
+# Scene cuts: consecutive dest-frame MSE above max(min, median * ratio)
+SCENE_CHANGE_RATIO = 4.0
+SCENE_CHANGE_MIN_MSE = 800.0
 
 PRESET_JSON = Path(
     os.environ.get("HANDBRAKE_PRESET_JSON", BASE_DIR.parent / "config" / "presets" / "Super8Scan.json")
@@ -57,7 +67,14 @@ COMPARE_POSITIONS = (0.25, 0.50, 0.75)
 
 
 def ensure_dirs() -> None:
-    for path in (WATCH_BASE, OUTPUT_BASE, MEDIA_BASE, UPLOAD_TMP, LOG_FILE.parent):
+    for path in (
+        WATCH_BASE,
+        OUTPUT_BASE,
+        LIBRARY_BASE,
+        MEDIA_BASE,
+        UPLOAD_TMP,
+        LOG_FILE.parent,
+    ):
         path.mkdir(parents=True, exist_ok=True)
     for folder in PRESET_MAP:
         (WATCH_BASE / folder).mkdir(parents=True, exist_ok=True)
