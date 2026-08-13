@@ -40,21 +40,19 @@ from app.config import (
     PRESET_MAP,
     PREVIEW_PAD_FRAMES,
     UPLOAD_TMP,
-    WATCH_BASE,
     ensure_dirs,
     human_size,
 )
 from app.db import SessionLocal, init_db
 from app.diff import compare_frame_files
 from app.encoder import (
-    _encoding_lock,
     clear_cancel,
     extract_only,
     get_current_encode_path,
     get_current_job_id,
     request_cancel,
-    run_preview,
     signal_current_proc,
+    wakeup_job_worker,
 )
 from app.frames import (
     compute_match_noise_graph,
@@ -67,8 +65,8 @@ from app.frames import (
 )
 from app.logging_config import setup_logging
 from app.models import ComparisonFrame, EncodeJob, LibraryFile
-from app.paths import is_under, ticket_name_for_job, unlink_watch_ticket
-from app.watcher import broadcast_system_loop, broadcast_watch_update, list_watch_files, watch_folders
+from app.paths import is_under
+from app.watcher import broadcast_system_loop, job_worker
 from app.ws import manager
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -88,13 +86,13 @@ async def lifespan(app: FastAPI):
     setup_logging(LOG_FILE)
     ensure_dirs()
     _console(
-        f"API starting — watch={WATCH_BASE} output={OUTPUT_BASE} media={MEDIA_BASE}"
+        f"API starting — library={LIBRARY_BASE} output={OUTPUT_BASE} media={MEDIA_BASE}"
     )
     init_db()
     _console("DB ready")
-    asyncio.create_task(watch_folders())
+    asyncio.create_task(job_worker())
     asyncio.create_task(broadcast_system_loop())
-    _console("Background watcher + system broadcast started")
+    _console("Job worker + system broadcast started")
     yield
     _console("API shutting down")
 
@@ -184,11 +182,6 @@ def _cleanup_job_files(job: EncodeJob) -> None:
                 _unlink_under(parent, UPLOAD_TMP)
     elif job.kind == "encode" and job.dest_path:
         _unlink_under(job.dest_path, OUTPUT_BASE)
-
-    if job.kind == "encode" and job.source_path and job.preset in PRESET_MAP:
-        suffix = Path(job.source_path).suffix
-        ticket = WATCH_BASE / job.preset / ticket_name_for_job(job.id, suffix)
-        unlink_watch_ticket(ticket, WATCH_BASE)
 
 
 def _source_label(job: EncodeJob, db) -> str:
@@ -311,10 +304,6 @@ async def health():
 @app.get("/presets")
 async def get_presets():
     presets = sorted(PRESET_MAP.keys())
-    if WATCH_BASE.exists():
-        on_disk = sorted(d.name for d in WATCH_BASE.iterdir() if d.is_dir())
-        if on_disk:
-            presets = on_disk
     formats = {k: PRESET_MAP[k][1] for k in PRESET_MAP}
     return JSONResponse({"presets": presets, "formats": formats})
 
@@ -324,7 +313,7 @@ async def get_presets():
 async def websocket_endpoint(ws: WebSocket):
     await manager.connect(ws)
     try:
-        await ws.send_json({"type": "watch_update", "files": list_watch_files()})
+        await ws.send_json({"type": "hello"})
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
@@ -484,7 +473,7 @@ class CreateJobBody(BaseModel):
 
 
 @app.post("/api/jobs")
-async def create_job(body: CreateJobBody, background_tasks: BackgroundTasks):
+async def create_job(body: CreateJobBody):
     if body.preset not in PRESET_MAP:
         raise HTTPException(status_code=400, detail=f"Invalid preset: {body.preset}")
     if body.kind not in ("encode", "preview"):
@@ -556,25 +545,13 @@ async def create_job(body: CreateJobBody, background_tasks: BackgroundTasks):
             job.dest_path = str(dest)
             db.commit()
 
-            ticket = WATCH_BASE / body.preset / ticket_name_for_job(job.id, real_source.suffix)
-            if ticket.exists() or ticket.is_symlink():
-                db.delete(job)
-                db.commit()
-                raise HTTPException(status_code=409, detail="Watch ticket already exists")
-            ticket.symlink_to(real_source)
-            await broadcast_watch_update()
-        else:
-            # preview — no watch ticket; run on encoding lock in background
-            background_tasks.add_task(_run_preview_locked, job.id)
-
+        wakeup_job_worker()
+        await manager.broadcast(
+            {"type": "job_queued", "job_id": job.id, "file": job.filename, "kind": job.kind}
+        )
         return JSONResponse(job_to_dict(job, db))
     finally:
         db.close()
-
-
-async def _run_preview_locked(job_id: int) -> None:
-    async with _encoding_lock:
-        await run_preview(job_id)
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -586,15 +563,9 @@ async def cancel_job(job_id: int):
             raise HTTPException(status_code=404, detail="Job not found")
 
         if job.status == "queued":
-            # Unlink watch ticket if encode
-            if job.kind == "encode" and job.source_path:
-                suffix = Path(job.source_path).suffix
-                ticket = WATCH_BASE / job.preset / ticket_name_for_job(job.id, suffix)
-                unlink_watch_ticket(ticket, WATCH_BASE)
             job.status = "cancelled"
             job.error = "Cancelled"
             db.commit()
-            await broadcast_watch_update()
             await manager.broadcast(
                 {"type": "encode_cancelled", "job_id": job_id, "file": job.filename}
             )
@@ -614,13 +585,8 @@ async def cancel_job(job_id: int):
                         Path(job.dest_clip_path).unlink(missing_ok=True)
                     if job.source_clip_path:
                         Path(job.source_clip_path).unlink(missing_ok=True)
-                if job.kind == "encode" and job.source_path:
-                    suffix = Path(job.source_path).suffix
-                    ticket = WATCH_BASE / job.preset / ticket_name_for_job(job.id, suffix)
-                    unlink_watch_ticket(ticket, WATCH_BASE)
                 db.commit()
                 clear_cancel(job_id)
-            await broadcast_watch_update()
             return JSONResponse({"status": "cancelling", "job_id": job_id})
 
         if job.status == "extracting":
@@ -918,29 +884,6 @@ async def post_preview_noise_score(job_id: int, offset: int | None = None):
         db.close()
 
 
-# ── Watch queue ────────────────────────────────────────────────────────────
-@app.get("/api/watch_queue")
-@app.get("/watch_queue")
-async def get_watch_queue():
-    return JSONResponse(list_watch_files())
-
-
-@app.delete("/api/watch/{folder}/{filename}")
-@app.delete("/watch/{folder}/{filename}")
-async def delete_watch_file(folder: str, filename: str):
-    """Remove a watch ticket without following the symlink target."""
-    safe_filename = Path(filename).name
-    fp = WATCH_BASE / folder / safe_filename
-    if not is_under(fp, WATCH_BASE):
-        raise HTTPException(status_code=403, detail="Access denied")
-    if not fp.exists() and not fp.is_symlink():
-        raise HTTPException(status_code=404, detail="File not found")
-    if not unlink_watch_ticket(fp, WATCH_BASE):
-        raise HTTPException(status_code=403, detail="Access denied")
-    await broadcast_watch_update()
-    return JSONResponse({"status": "deleted"})
-
-
 # ── Activity log ───────────────────────────────────────────────────────────
 @app.get("/api/queue")
 @app.get("/queue")
@@ -1184,7 +1127,6 @@ async def delete_job(job_id: int):
         _cleanup_job_files(job)
         db.delete(job)
         db.commit()
-        await broadcast_watch_update()
         await manager.broadcast({"type": "job_deleted", "job_id": job_id})
         return JSONResponse({"status": "deleted", "job_id": job_id})
     finally:

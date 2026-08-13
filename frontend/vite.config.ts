@@ -17,8 +17,6 @@ export default defineConfig({
       '/api': { target: apiTarget, changeOrigin: true },
       '/presets': { target: apiTarget, changeOrigin: true },
       '/upload': { target: apiTarget, changeOrigin: true },
-      '/watch_queue': { target: apiTarget, changeOrigin: true },
-      '/watch': { target: apiTarget, changeOrigin: true },
       '/queue': { target: apiTarget, changeOrigin: true },
       '/outputs': { target: apiTarget, changeOrigin: true },
       '/download': { target: apiTarget, changeOrigin: true },

@@ -17,7 +17,6 @@ from app.config import (
     PRESET_MAP,
     PREVIEW_PAD_FRAMES,
     PREVIEW_WARMUP,
-    WATCH_BASE,
     human_size,
 )
 from app.db import SessionLocal
@@ -29,16 +28,29 @@ from app.frames import (
     probe_video,
 )
 from app.models import ComparisonFrame, EncodeJob, LibraryFile
-from app.paths import parse_job_id_from_ticket, unlink_watch_ticket
 from app.ws import manager
 
 log = logging.getLogger(__name__)
 
 _encoding_lock = asyncio.Lock()
+_job_wakeup = asyncio.Event()
 _current_encode_path: str | None = None
 _current_job_id: int | None = None
 _current_proc: asyncio.subprocess.Process | None = None
 _cancel_requested: set[int] = set()
+
+
+def wakeup_job_worker() -> None:
+    """Unblock the DB job worker after a new queued job is inserted."""
+    _job_wakeup.set()
+
+
+async def wait_for_job(timeout: float = 2.0) -> None:
+    try:
+        await asyncio.wait_for(_job_wakeup.wait(), timeout=timeout)
+    except TimeoutError:
+        pass
+    _job_wakeup.clear()
 
 
 def get_current_encode_file() -> str | None:
@@ -168,6 +180,11 @@ def _handbrake_import_args(preset_name: str) -> list[str]:
     return []
 
 
+def _handbrake_input(path: Path) -> str:
+    """HandBrake 1.7.2 on Ubuntu does not follow input-file symlinks."""
+    return str(path.resolve() if path.is_symlink() else path)
+
+
 def _keep_tracks_args(keep: bool) -> list[str]:
     """Override preset track selection so extra audio/subs are muxed, not burned."""
     if not keep:
@@ -175,38 +192,180 @@ def _keep_tracks_args(keep: bool) -> list[str]:
     return ["--all-audio", "--all-subtitles", "--subtitle-burned", "none"]
 
 
-def _resolve_job_for_ticket(
-    db,
-    folder: str,
-    infile_path: Path,
-    job_id: int | None,
-) -> EncodeJob | None:
-    if job_id is not None:
+async def run_encode(job_id: int) -> None:
+    """Run HandBrakeCLI from a queued DB job, then extract comparison frames."""
+    global _current_encode_path, _current_job_id, _current_proc
+
+    db = SessionLocal()
+    try:
         job = db.get(EncodeJob, job_id)
-        if job is not None:
-            return job
-    parsed = parse_job_id_from_ticket(infile_path.name)
-    if parsed is not None:
-        job = db.get(EncodeJob, parsed)
-        if job is not None and job.preset == folder and job.status in (
-            "queued",
-            "encoding",
-        ):
-            return job
-    # Fallback: match by real source_path + preset
-    real = str(infile_path.resolve()) if infile_path.exists() else str(infile_path)
-    return (
-        db.query(EncodeJob)
-        .filter(
-            EncodeJob.origin == "encode",
-            EncodeJob.kind == "encode",
-            EncodeJob.status.in_(("queued", "encoding")),
-            EncodeJob.preset == folder,
-            EncodeJob.source_path == real,
+        if job is None:
+            return
+        if job.status == "cancelled" or is_cancel_requested(job_id):
+            clear_cancel(job_id)
+            job.status = "cancelled"
+            _touch(job)
+            db.commit()
+            return
+
+        folder = job.preset
+        if folder not in PRESET_MAP:
+            job.status = "failed"
+            job.error = f"Unknown preset: {folder}"
+            db.commit()
+            return
+
+        source = Path(job.source_path) if job.source_path else None
+        if not source or not source.exists():
+            job.status = "failed"
+            job.error = "Source file missing"
+            db.commit()
+            return
+
+        preset, fmt, extra_args = PRESET_MAP[folder]
+        out_dir = OUTPUT_BASE / folder
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = Path(job.dest_path) if job.dest_path else (
+            out_dir / f"{Path(job.filename).stem}.{job.id}.{fmt}"
         )
-        .order_by(EncodeJob.id.desc())
-        .first()
-    )
+        job.status = "encoding"
+        job.dest_path = str(out_path)
+        job.error = None
+        job.progress = 0.0
+        _touch(job)
+        db.commit()
+
+        out_name = out_path.name
+        display = job.filename
+        _current_job_id = job_id
+        _current_encode_path = str(out_path)
+
+        log.info(
+            "ENCODING [%s] job=%s %s -> %s (preset: %s keep_tracks=%s src=%s)",
+            folder,
+            job_id,
+            display,
+            out_name,
+            preset,
+            bool(job.keep_tracks),
+            source,
+        )
+
+        import_args = _handbrake_import_args(preset)
+        cmd = [
+            HANDBRAKE_BIN,
+            *import_args,
+            "-Z",
+            preset,
+            "-i",
+            _handbrake_input(source),
+            "-o",
+            str(out_path),
+            *extra_args,
+            *_keep_tracks_args(bool(job.keep_tracks)),
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            limit=4 * 1024 * 1024,
+        )
+        _current_proc = proc
+
+        t0 = time.monotonic()
+        await _read_handbrake_progress(proc, job, db, job_id, display)
+        await proc.wait()
+        encode_secs = time.monotonic() - t0
+        _current_proc = None
+
+        if is_cancel_requested(job_id):
+            clear_cancel(job_id)
+            job.status = "cancelled"
+            job.error = "Cancelled"
+            _touch(job)
+            db.commit()
+            if out_path.exists():
+                out_path.unlink(missing_ok=True)
+            await manager.broadcast(
+                {"type": "encode_cancelled", "job_id": job_id, "file": display}
+            )
+            return
+
+        if proc.returncode != 0:
+            log.error("FAILED: %s (exit %s)", display, proc.returncode)
+            job.status = "failed"
+            job.error = f"HandBrake exit {proc.returncode}"
+            _touch(job)
+            db.commit()
+            await manager.broadcast(
+                {
+                    "type": "encode_failed",
+                    "job_id": job_id,
+                    "file": display,
+                    "exit_code": proc.returncode,
+                }
+            )
+            return
+
+        size = out_path.stat().st_size if out_path.exists() else 0
+        job.progress = 100.0
+        persist_job_metrics(job, db, out_path, dest_size=size, encode_secs=encode_secs)
+        job.status = "extracting"
+        _touch(job)
+        db.commit()
+
+        log.info("DONE encode: %s (%s)", out_name, human_size(size))
+        await manager.broadcast(
+            {
+                "type": "encode_done",
+                "job_id": job_id,
+                "file": display,
+                "size": size,
+            }
+        )
+
+        try:
+            pairs = await asyncio.to_thread(
+                extract_comparison_frames,
+                job_id,
+                source,
+                out_path,
+            )
+            for existing in list(job.frames):
+                db.delete(existing)
+            db.flush()
+            for pos, src_png, dst_png in pairs:
+                db.add(
+                    ComparisonFrame(
+                        job_id=job_id,
+                        position=pos,
+                        source_png=str(src_png),
+                        dest_png=str(dst_png),
+                    )
+                )
+            job.status = "done"
+            _touch(job)
+            db.commit()
+            await manager.broadcast(
+                {
+                    "type": "compare_ready",
+                    "job_id": job_id,
+                    "file": display,
+                }
+            )
+        except Exception as exc:
+            log.exception("Frame extraction failed for job %s", job_id)
+            job.status = "done"
+            job.error = f"Encode ok; frame extract failed: {exc}"
+            _touch(job)
+            db.commit()
+
+    finally:
+        _current_encode_path = None
+        _current_job_id = None
+        _current_proc = None
+        db.close()
 
 
 async def _read_handbrake_progress(
@@ -281,204 +440,6 @@ async def _read_handbrake_progress(
             )
 
 
-async def run_encode(folder: str, infile_path: Path, job_id: int | None = None) -> None:
-    """Run HandBrakeCLI on a watch ticket, then extract comparison frames.
-
-    Unlinks only the watch ticket on success — never the library/source file.
-    """
-    global _current_encode_path, _current_job_id, _current_proc
-
-    if folder not in PRESET_MAP:
-        log.error("Unknown preset folder: %s", folder)
-        return
-
-    preset, fmt, extra_args = PRESET_MAP[folder]
-    out_dir = OUTPUT_BASE / folder
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    db = SessionLocal()
-    job: EncodeJob | None = None
-    try:
-        job = _resolve_job_for_ticket(db, folder, infile_path, job_id)
-        if job is None:
-            # Orphan real drop-in: create job with job-id dest name after insert
-            real_source = str(infile_path.resolve()) if infile_path.exists() else str(infile_path)
-            stem = Path(infile_path.name).stem
-            # Temporary dest; rewrite after we have id
-            job = EncodeJob(
-                filename=infile_path.name,
-                preset=folder,
-                status="encoding",
-                origin="encode",
-                kind="encode",
-                source_path=real_source,
-                dest_path="",
-            )
-            db.add(job)
-            db.commit()
-            db.refresh(job)
-            out_path = out_dir / f"{stem}.{job.id}.{fmt}"
-            job.dest_path = str(out_path)
-            db.commit()
-        else:
-            if job.status == "cancelled" or is_cancel_requested(job.id):
-                clear_cancel(job.id)
-                unlink_watch_ticket(infile_path, WATCH_BASE)
-                return
-            out_path = Path(job.dest_path) if job.dest_path else (
-                out_dir / f"{Path(job.filename).stem}.{job.id}.{fmt}"
-            )
-            job.status = "encoding"
-            job.dest_path = str(out_path)
-            # Keep source_path as real target — do not overwrite with ticket
-            if not job.source_path:
-                job.source_path = (
-                    str(infile_path.resolve()) if infile_path.exists() else str(infile_path)
-                )
-            job.error = None
-            _touch(job)
-            db.commit()
-
-        job_id = job.id
-        out_path = Path(job.dest_path)
-        out_name = out_path.name
-        display = job.filename
-        _current_job_id = job_id
-        _current_encode_path = str(out_path)
-
-        log.info(
-            "ENCODING [%s] job=%s %s -> %s (preset: %s keep_tracks=%s)",
-            folder,
-            job_id,
-            display,
-            out_name,
-            preset,
-            bool(job.keep_tracks),
-        )
-
-        import_args = _handbrake_import_args(preset)
-        cmd = [
-            HANDBRAKE_BIN,
-            *import_args,
-            "-Z",
-            preset,
-            "-i",
-            str(infile_path),
-            "-o",
-            str(out_path),
-            *extra_args,
-            *_keep_tracks_args(bool(job.keep_tracks)),
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            limit=4 * 1024 * 1024,
-        )
-        _current_proc = proc
-
-        t0 = time.monotonic()
-        await _read_handbrake_progress(proc, job, db, job_id, display)
-        await proc.wait()
-        encode_secs = time.monotonic() - t0
-        _current_proc = None
-
-        if is_cancel_requested(job_id):
-            clear_cancel(job_id)
-            job.status = "cancelled"
-            job.error = "Cancelled"
-            _touch(job)
-            db.commit()
-            if out_path.exists():
-                out_path.unlink(missing_ok=True)
-            unlink_watch_ticket(infile_path, WATCH_BASE)
-            await manager.broadcast(
-                {"type": "encode_cancelled", "job_id": job_id, "file": display}
-            )
-            return
-
-        if proc.returncode != 0:
-            log.error("FAILED: %s (exit %s)", display, proc.returncode)
-            job.status = "failed"
-            job.error = f"HandBrake exit {proc.returncode}"
-            _touch(job)
-            db.commit()
-            await manager.broadcast(
-                {
-                    "type": "encode_failed",
-                    "job_id": job_id,
-                    "file": display,
-                    "exit_code": proc.returncode,
-                }
-            )
-            unlink_watch_ticket(infile_path, WATCH_BASE)
-            return
-
-        size = out_path.stat().st_size if out_path.exists() else 0
-        job.progress = 100.0
-        persist_job_metrics(job, db, out_path, dest_size=size, encode_secs=encode_secs)
-        job.status = "extracting"
-        _touch(job)
-        db.commit()
-
-        log.info("DONE encode: %s (%s)", out_name, human_size(size))
-        await manager.broadcast(
-            {
-                "type": "encode_done",
-                "job_id": job_id,
-                "file": display,
-                "size": size,
-            }
-        )
-
-        source_for_frames = Path(job.source_path) if job.source_path else infile_path
-        try:
-            pairs = await asyncio.to_thread(
-                extract_comparison_frames,
-                job_id,
-                source_for_frames,
-                out_path,
-            )
-            for existing in list(job.frames):
-                db.delete(existing)
-            db.flush()
-            for pos, src_png, dst_png in pairs:
-                db.add(
-                    ComparisonFrame(
-                        job_id=job_id,
-                        position=pos,
-                        source_png=str(src_png),
-                        dest_png=str(dst_png),
-                    )
-                )
-            job.status = "done"
-            _touch(job)
-            db.commit()
-            await manager.broadcast(
-                {
-                    "type": "compare_ready",
-                    "job_id": job_id,
-                    "file": display,
-                }
-            )
-        except Exception as exc:
-            log.exception("Frame extraction failed for job %s", job_id)
-            job.status = "done"
-            job.error = f"Encode ok; frame extract failed: {exc}"
-            _touch(job)
-            db.commit()
-
-        # Unlink watch ticket only — never the library / parent source
-        unlink_watch_ticket(infile_path, WATCH_BASE)
-        log.info("Removed watch ticket: %s", infile_path.name)
-
-    finally:
-        _current_encode_path = None
-        _current_job_id = None
-        _current_proc = None
-        db.close()
-
 
 async def run_preview(job_id: int) -> None:
     """Encode a short HandBrake range around 25%, cut source pad, auto-align."""
@@ -547,7 +508,7 @@ async def run_preview(job_id: int) -> None:
             "-Z",
             preset,
             "-i",
-            str(source),
+            _handbrake_input(source),
             "-o",
             str(dest_clip),
             "--start-at",

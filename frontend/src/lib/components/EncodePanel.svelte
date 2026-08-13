@@ -48,9 +48,6 @@
   let library = $state<LibraryFile[]>([]);
   let outputs = $state<OutputFile[]>([]);
   let jobs = $state<EncodeJob[]>([]);
-  let watchFiles = $state<
-    { folder: string; name: string; display_name?: string; job_id?: number | null; size_human: string }[]
-  >([]);
   let currentEncodeFile = $state<string | null>(null);
   let hasLiveProgress = $state(false);
 
@@ -152,8 +149,8 @@
         uploadPct = 100;
         refreshLists();
         break;
-      case 'watch_update':
-        watchFiles = (msg.files as typeof watchFiles) || [];
+      case 'job_queued':
+        refreshLists();
         break;
       case 'encode_progress':
         applyEncodeProgress(msg);
@@ -240,24 +237,6 @@
       presets = [];
       presetFormats = {};
     }
-  }
-
-  async function pollWatch() {
-    try {
-      const files = await (await fetch('/api/watch_queue')).json();
-      watchFiles = files || [];
-    } catch {
-      /* ignore */
-    }
-  }
-
-  async function delWatch(folder: string, name: string) {
-    if (!confirm(`Remove ${name} from watch queue?`)) return;
-    await fetch(
-      `/api/watch/${encodeURIComponent(folder)}/${encodeURIComponent(name)}`,
-      { method: 'DELETE' }
-    );
-    pollWatch();
   }
 
   async function delOutput(presetName: string, name: string) {
@@ -378,7 +357,6 @@
         'success'
       );
       await refreshLists();
-      await pollWatch();
     } catch (err) {
       show((err as Error).message, 'error');
     } finally {
@@ -392,7 +370,6 @@
       await cancelJob(id);
       show(`Cancelled #${id}`, 'info');
       await refreshLists();
-      await pollWatch();
     } catch (err) {
       show((err as Error).message, 'error');
     }
@@ -418,11 +395,9 @@
     connectWS();
     loadPresets();
     refreshLists();
-    pollWatch();
     pollLog();
     pollTimer = setInterval(() => {
       refreshLists();
-      pollWatch();
       pollLog();
     }, 5000);
     fetch('/api/status')
@@ -619,23 +594,6 @@
               <div class="fi-actions">
                 <button class="btn btn-ghost narrow" onclick={() => onCancel(j.id)}>Cancel</button>
               </div>
-            </div>
-          {/each}
-        </div>
-      </div>
-    {/if}
-
-    {#if watchFiles.length}
-      <div class="section">
-        <div class="section-hdr"><h2>Watch queue</h2></div>
-        <div class="file-list">
-          {#each watchFiles as f}
-            <div class="file-row">
-              <div class="fi-body">
-                <div class="fi-name">{f.display_name || f.name}</div>
-                <div class="fi-meta">{f.folder} · {f.size_human}</div>
-              </div>
-              <button class="del-btn" onclick={() => delWatch(f.folder, f.name)}>✕</button>
             </div>
           {/each}
         </div>

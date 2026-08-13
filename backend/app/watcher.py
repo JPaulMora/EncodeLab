@@ -1,175 +1,95 @@
-"""Filesystem watcher for watch/<preset>/ drop folders (tickets / leftover files)."""
+"""DB-backed encode/preview worker and system status broadcast."""
 from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
+import time
 from pathlib import Path
 
-from app.config import (
-    PRESET_MAP,
-    SKIP_PREFIXES,
-    SKIP_SUFFIXES,
-    VIDEO_EXTS,
-    WATCH_BASE,
-    ensure_dirs,
-    human_size,
-)
+from app.config import human_size
 from app.db import SessionLocal
-from app.encoder import _encoding_lock, run_encode
+from app.encoder import (
+    _encoding_lock,
+    get_current_encode_path,
+    run_encode,
+    run_preview,
+    wait_for_job,
+)
 from app.models import EncodeJob
-from app.paths import parse_job_id_from_ticket
 from app.ws import manager
 
 log = logging.getLogger(__name__)
 
 
-def _is_video_candidate(path: Path) -> bool:
-    # Accept symlinks or real files (is_file follows symlinks)
-    if not (path.is_symlink() or path.is_file()):
-        return False
-    if path.is_symlink() and not path.exists():
-        # dangling — still a candidate to clean up later; skip encode
-        return False
-    if not path.is_file():
-        return False
-    if any(path.name.startswith(p) for p in SKIP_PREFIXES):
-        return False
-    if path.suffix.lower().endswith(SKIP_SUFFIXES):
-        return False
-    if path.suffix.lower() not in VIDEO_EXTS:
-        return False
-    return True
-
-
-def list_watch_files() -> list[dict]:
-    files: list[dict] = []
-    if not WATCH_BASE.exists():
-        return files
+def _recover_stale_jobs() -> None:
+    """Re-queue jobs left encoding/previewing after an API restart."""
     db = SessionLocal()
     try:
-        for folder in PRESET_MAP:
-            d = WATCH_BASE / folder
-            if not d.exists():
-                continue
-            for f in sorted(d.iterdir()):
-                if not _is_video_candidate(f):
-                    continue
-                try:
-                    size = f.stat().st_size
-                except OSError:
-                    size = 0
-                job_id = parse_job_id_from_ticket(f.name)
-                display = f.name
-                job = None
-                if job_id is not None:
-                    job = db.get(EncodeJob, job_id)
-                if job is None:
-                    job = (
-                        db.query(EncodeJob)
-                        .filter(
-                            EncodeJob.preset == folder,
-                            EncodeJob.status == "queued",
-                            EncodeJob.kind == "encode",
-                        )
-                        .order_by(EncodeJob.id.desc())
-                        .first()
-                    )
-                if job:
-                    display = job.filename
-                    job_id = job.id
-                files.append(
-                    {
-                        "folder": folder,
-                        "name": f.name,
-                        "display_name": display,
-                        "job_id": job_id,
-                        "size": size,
-                        "size_human": human_size(size),
-                    }
-                )
+        stale = (
+            db.query(EncodeJob)
+            .filter(EncodeJob.status.in_(("encoding", "previewing", "extracting")))
+            .all()
+        )
+        for job in stale:
+            log.warning("Recovering stale job %s (%s → queued)", job.id, job.status)
+            job.status = "queued"
+        if stale:
+            db.commit()
     finally:
         db.close()
-    return files
 
 
-async def broadcast_watch_update() -> None:
-    await manager.broadcast({"type": "watch_update", "files": list_watch_files()})
-
-
-async def watch_folders() -> None:
+def _next_queued_job() -> tuple[int, str] | None:
+    db = SessionLocal()
     try:
-        from watchfiles import Change, awatch
-    except ImportError:
-        log.error("watchfiles not installed")
-        return
+        job = (
+            db.query(EncodeJob)
+            .filter(
+                EncodeJob.status == "queued",
+                EncodeJob.kind.in_(("encode", "preview")),
+            )
+            .order_by(EncodeJob.id.asc())
+            .first()
+        )
+        if job is None:
+            return None
+        return job.id, job.kind
+    finally:
+        db.close()
 
-    ensure_dirs()
-    log.info("=== encoder-watch started. Watching: %s ===", list(PRESET_MAP.keys()))
-    await broadcast_watch_update()
 
-    # Startup scan
-    for folder in PRESET_MAP:
-        d = WATCH_BASE / folder
-        for f in sorted(d.iterdir()):
-            if not _is_video_candidate(f):
-                continue
-            job_id = parse_job_id_from_ticket(f.name)
-            log.info("STARTUP SCAN: %s in [%s] job_id=%s", f.name, folder, job_id)
-            await broadcast_watch_update()
-            async with _encoding_lock:
-                if f.exists() or f.is_symlink():
-                    await run_encode(folder, f, job_id=job_id)
-            await broadcast_watch_update()
-
-    async for changes in awatch(str(WATCH_BASE)):
-        for change_type, path_str in changes:
-            if change_type not in (Change.added, Change.modified):
-                continue
-            path = Path(path_str)
-            if not _is_video_candidate(path):
-                continue
+async def job_worker() -> None:
+    """Pick queued encode/preview jobs from the DB and run them one at a time."""
+    _recover_stale_jobs()
+    log.info("=== job worker started (DB queue) ===")
+    while True:
+        nxt = _next_queued_job()
+        if nxt is None:
+            await wait_for_job(2.0)
+            continue
+        job_id, kind = nxt
+        log.info("WORKER pickup job=%s kind=%s", job_id, kind)
+        async with _encoding_lock:
             try:
-                rel = path.relative_to(WATCH_BASE)
-            except ValueError:
-                continue
-            if len(rel.parts) != 2:
-                continue
-            folder = rel.parts[0]
-            if folder not in PRESET_MAP:
-                continue
-
-            job_id = parse_job_id_from_ticket(path.name)
-            log.info("DETECTED: %s in [%s] job_id=%s", path.name, folder, job_id)
-            await broadcast_watch_update()
-
-            async with _encoding_lock:
-                if path.exists() or path.is_symlink():
-                    orphan = (
-                        subprocess.run(
-                            ["pgrep", "-x", "HandBrakeCLI"], capture_output=True
-                        ).returncode
-                        == 0
-                    )
-                    if orphan:
-                        log.warning(
-                            "HandBrakeCLI already running — queuing %s", path.name
-                        )
-                    else:
-                        try:
-                            await run_encode(folder, path, job_id=job_id)
-                        except Exception as enc_err:
-                            log.error("Encode crashed for %s: %s", path.name, enc_err)
-
-            await broadcast_watch_update()
+                if kind == "preview":
+                    await run_preview(job_id)
+                else:
+                    await run_encode(job_id)
+            except Exception:
+                log.exception("Job %s crashed", job_id)
+                db = SessionLocal()
+                try:
+                    job = db.get(EncodeJob, job_id)
+                    if job and job.status in ("queued", "encoding", "previewing"):
+                        job.status = "failed"
+                        job.error = "Worker crashed"
+                        db.commit()
+                finally:
+                    db.close()
 
 
 async def broadcast_system_loop() -> None:
     """Push CPU + encode status every 3 seconds."""
-    import time
-
-    from app.config import OUTPUT_BASE
-    from app.encoder import get_current_encode_path
 
     def cgroup_usage_usec() -> int:
         try:
