@@ -1,11 +1,18 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { onDestroy, onMount } from 'svelte';
-
-  const CHUNK = 16 * 1024 * 1024;
+  import {
+    cancelJob,
+    createJob,
+    deleteLibrary,
+    fetchJobs,
+    fetchLibrary,
+    fetchOutputs,
+    uploadLibraryFile
+  } from '$lib/api';
+  import type { EncodeJob, JobSource, LibraryFile, OutputFile } from '$lib/types';
 
   let presets = $state<string[]>([]);
-  let preset = $state('');
   let selectedFile = $state<File | null>(null);
   let wsConnected = $state(false);
   let statusMsg = $state('');
@@ -15,9 +22,6 @@
   let uploadActive = $state(false);
   let uploadPct = $state(0);
   let uploadName = $state('—');
-  let uploadSpd = $state('');
-  let uploadEff = $state('');
-  let uploadEta = $state('');
 
   let encodeActive = $state(false);
   let encodeFlash = $state<'green' | 'red' | ''>('');
@@ -28,21 +32,25 @@
 
   let cpuPct = $state<number | null>(null);
   let footerEnc = $state('');
+  let logOpen = $state(false);
+  let recentLines = $state<string[]>([]);
 
-  let queueLines = $state<{ raw: string; status: string; progress: number | null }[]>([]);
-  let watchFiles = $state<{ folder: string; name: string; size_human: string }[]>([]);
-  let outputs = $state<
-    { name: string; preset: string; size_human: string; download_url: string }[]
+  let library = $state<LibraryFile[]>([]);
+  let outputs = $state<OutputFile[]>([]);
+  let jobs = $state<EncodeJob[]>([]);
+  let watchFiles = $state<
+    { folder: string; name: string; display_name?: string; job_id?: number | null; size_human: string }[]
   >([]);
   let currentEncodeFile = $state<string | null>(null);
   let hasLiveProgress = $state(false);
 
+  /** Per-row preset pickers keyed by `lib:id` or `job:id` */
+  let rowPreset = $state<Record<string, string>>({});
+  let busyKey = $state<string | null>(null);
+
   let ws: WebSocket | null = null;
   let wsBackoff = 1000;
-  let uploadTotalBytes = 0;
-  let uploadConfirmedBytes = 0;
-  let uploadChunkTimes: { bytes: number; ms: number }[] = [];
-  let queueTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
   let dragover = $state(false);
 
   function show(msg: string, type: 'success' | 'error' | 'info') {
@@ -65,6 +73,29 @@
     return `${n.toFixed(1)} ${u[i]}`;
   }
 
+  function presetFor(key: string) {
+    return rowPreset[key] || presets[0] || '';
+  }
+
+  function setPreset(key: string, value: string) {
+    rowPreset = { ...rowPreset, [key]: value };
+  }
+
+  async function refreshLists() {
+    try {
+      const [lib, outs, j] = await Promise.all([
+        fetchLibrary(),
+        fetchOutputs(),
+        fetchJobs(100)
+      ]);
+      library = lib;
+      outputs = outs;
+      jobs = j;
+    } catch {
+      /* ignore transient */
+    }
+  }
+
   function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -78,164 +109,96 @@
       wsBackoff = Math.min(wsBackoff * 2, 30000);
     };
     ws.onerror = () => ws?.close();
-    ws.onmessage = (evt) => {
+    ws.onmessage = (ev) => {
       try {
-        handleWS(JSON.parse(evt.data));
+        handleMsg(JSON.parse(ev.data));
       } catch {
         /* ignore */
       }
     };
   }
 
-  function handleWS(msg: Record<string, unknown>) {
+  function handleMsg(msg: Record<string, unknown>) {
     switch (msg.type) {
       case 'chunk_ack':
-        onChunkAck(msg as { index: number; total: number; server_bytes: number; decompressed_bytes: number });
         break;
-      case 'upload_complete':
+      case 'library_upload_complete':
         uploadPct = 100;
-        uploadEta = '✓ Upload complete';
-        break;
-      case 'encode_progress':
-        onEncodeProgress(msg as { file?: string; pct?: number; fps?: number; eta_seconds?: number });
-        break;
-      case 'encode_done':
-        onEncodeDone(msg as { file?: string });
-        break;
-      case 'encode_failed':
-        onEncodeFailed(msg as { file?: string; exit_code?: number });
+        refreshLists();
         break;
       case 'watch_update':
         watchFiles = (msg.files as typeof watchFiles) || [];
         break;
-      case 'system':
-        applySystemStatus(msg as Record<string, unknown>);
+      case 'encode_progress':
+        applyEncodeProgress(msg);
         break;
+      case 'encode_done':
+      case 'preview_ready':
       case 'compare_ready':
-        pollOutputs();
+        encodeFlash = 'green';
+        encodeActive = true;
+        encPct = '100%';
+        encBar = 100;
+        encSub = msg.type === 'preview_ready' ? 'Preview ready' : 'Done';
+        setTimeout(() => (encodeFlash = ''), 1200);
+        refreshLists();
+        if (msg.type === 'preview_ready' && msg.job_id) {
+          goto(`/compare?job=${msg.job_id}`);
+        }
+        break;
+      case 'encode_failed':
+        encodeFlash = 'red';
+        encSub = 'Failed';
+        setTimeout(() => (encodeFlash = ''), 1500);
+        refreshLists();
+        break;
+      case 'encode_cancelled':
+        encSub = 'Cancelled';
+        encodeActive = false;
+        refreshLists();
+        break;
+      case 'system':
+        applySystemStatus(msg);
         break;
     }
   }
 
-  function onChunkAck(msg: {
-    index: number;
-    total: number;
-    server_bytes: number;
-    decompressed_bytes: number;
-  }) {
-    uploadConfirmedBytes += msg.decompressed_bytes;
-    uploadPct =
-      uploadTotalBytes > 0
-        ? Math.min(100, Math.round((uploadConfirmedBytes / uploadTotalBytes) * 100))
-        : Math.round(((msg.index + 1) / msg.total) * 100);
-
-    const now = Date.now();
-    uploadChunkTimes.push({ bytes: msg.decompressed_bytes, ms: now });
-    if (uploadChunkTimes.length > 6) uploadChunkTimes.shift();
-
-    uploadSpd = '';
-    uploadEff = '';
-    uploadEta = '';
-    if (uploadChunkTimes.length >= 2) {
-      const oldest = uploadChunkTimes[0];
-      const newest = uploadChunkTimes[uploadChunkTimes.length - 1];
-      const elapsed = (newest.ms - oldest.ms) / 1000;
-      const bytes = uploadChunkTimes.slice(1).reduce((s, c) => s + c.bytes, 0);
-      if (elapsed > 0) {
-        const bps = bytes / elapsed;
-        const remaining = uploadTotalBytes - uploadConfirmedBytes;
-        const etaSec = remaining > 0 ? Math.round(remaining / bps) : 0;
-        const dt =
-          uploadChunkTimes[uploadChunkTimes.length - 1].ms -
-          uploadChunkTimes[uploadChunkTimes.length - 2].ms;
-        if (dt > 0) {
-          const wireMBs = ((msg.server_bytes / dt) * 1000) / 1024 / 1024;
-          uploadSpd = `Wire: ${wireMBs.toFixed(1)} MB/s`;
-        }
-        if (msg.server_bytes < msg.decompressed_bytes) {
-          const effMBs = (bps / 1024 / 1024).toFixed(1);
-          const pctSaved = Math.round(100 * (1 - msg.server_bytes / msg.decompressed_bytes));
-          uploadEff = `Effective: ${effMBs} MB/s (${pctSaved}% saved)`;
-        }
-        if (etaSec > 0) {
-          const m = Math.floor(etaSec / 60);
-          const s = etaSec % 60;
-          uploadEta = `ETA: ${m > 0 ? m + 'm ' : ''}${s}s`;
-        }
-      }
-    }
-  }
-
-  function onEncodeProgress(msg: {
-    file?: string;
-    pct?: number;
-    fps?: number;
-    eta_seconds?: number;
-  }) {
+  function applyEncodeProgress(msg: Record<string, unknown>) {
+    encodeActive = true;
     hasLiveProgress = true;
-    currentEncodeFile = msg.file || null;
-    encodeActive = true;
-    encodeFlash = '';
-    encFname = msg.file || '—';
-    encPct = `${(msg.pct || 0).toFixed(1)}%`;
-    encBar = msg.pct || 0;
-    let sub = '';
-    if (msg.fps) sub += `${msg.fps.toFixed(1)} fps`;
-    if (msg.eta_seconds != null) {
-      const h = Math.floor(msg.eta_seconds / 3600);
-      const m = Math.floor((msg.eta_seconds % 3600) / 60);
-      const s = msg.eta_seconds % 60;
-      sub += (sub ? '  ·  ' : '') + 'ETA: ';
-      if (h) sub += `${h}h `;
-      if (m) sub += `${m}m `;
-      sub += `${s}s`;
-    }
-    encSub = sub;
+    const pct = Number(msg.pct ?? 0);
+    encFname = String(msg.file || '—');
+    encPct = `${pct.toFixed(1)}%`;
+    encBar = pct;
+    currentEncodeFile = String(msg.file || '');
+    const fps = msg.fps != null ? `${Number(msg.fps).toFixed(1)} fps` : '';
+    const eta =
+      msg.eta_seconds != null
+        ? `ETA ${Math.floor(Number(msg.eta_seconds) / 60)}m ${Number(msg.eta_seconds) % 60}s`
+        : '';
+    encSub = [fps, eta].filter(Boolean).join(' · ');
+    footerEnc = encFname;
   }
 
-  function onEncodeDone(msg: { file?: string }) {
-    hasLiveProgress = false;
-    currentEncodeFile = null;
-    encodeActive = true;
-    encodeFlash = 'green';
-    encFname = msg.file || '—';
-    encPct = '100%';
-    encBar = 100;
-    encSub = '✓ Encode complete';
-    setTimeout(() => {
+  function applySystemStatus(msg: Record<string, unknown>) {
+    if (msg.cpu_pct != null) cpuPct = Number(msg.cpu_pct);
+    if (msg.encoding) {
+      if (!hasLiveProgress) currentEncodeFile = String(msg.encoding_file || '');
+      footerEnc = String(msg.encoding_file || '');
+      encodeActive = true;
+    } else if (!hasLiveProgress) {
+      currentEncodeFile = null;
       encodeActive = false;
-    }, 8000);
-    pollOutputs();
-  }
-
-  function onEncodeFailed(msg: { file?: string; exit_code?: number }) {
-    hasLiveProgress = false;
-    currentEncodeFile = null;
-    encodeActive = true;
-    encodeFlash = 'red';
-    encFname = msg.file || '—';
-    encPct = '✗';
-    encBar = 0;
-    encSub = `Encode failed (exit ${msg.exit_code})`;
-  }
-
-  function applySystemStatus(d: Record<string, unknown>) {
-    if (typeof d.cpu_pct === 'number') cpuPct = d.cpu_pct;
-    if (d.encoding_file) {
-      footerEnc = `⚙ ${d.encoding_file}`;
-      if (!currentEncodeFile) currentEncodeFile = String(d.encoding_file);
-      if (encodeFlash !== 'green' && encodeFlash !== 'red') {
-        encodeActive = true;
-        encFname = String(d.encoding_file);
-        if (!hasLiveProgress) {
-          encPct = 'Encoding…';
-          encBar = 50;
-          if (d.encoding_size_human) encSub = `${d.encoding_size_human} written`;
-        }
-      }
-    } else {
       footerEnc = '';
-      if (!hasLiveProgress) currentEncodeFile = null;
+    }
+  }
+
+  async function pollLog() {
+    try {
+      const d = await (await fetch('/api/queue')).json();
+      recentLines = (d.lines || []).slice(-4).map((l: { raw: string }) => l.raw);
+    } catch {
+      /* ignore */
     }
   }
 
@@ -243,27 +206,8 @@
     try {
       const d = await (await fetch('/api/presets')).json();
       presets = d.presets || [];
-      if (presets.length && !preset) preset = presets[0];
     } catch {
       presets = [];
-    }
-  }
-
-  async function pollQueue() {
-    try {
-      const d = await (await fetch('/api/queue')).json();
-      queueLines = d.lines || [];
-    } catch {
-      /* ignore */
-    }
-  }
-
-  async function pollOutputs() {
-    try {
-      const d = await (await fetch('/api/outputs')).json();
-      outputs = d.files || [];
-    } catch {
-      /* ignore */
     }
   }
 
@@ -276,18 +220,13 @@
     }
   }
 
-  async function clearQueue() {
-    await fetch('/api/queue/clear', { method: 'POST' });
-    pollQueue();
-  }
-
   async function delWatch(folder: string, name: string) {
     if (!confirm(`Remove ${name} from watch queue?`)) return;
-    const r = await fetch(
+    await fetch(
       `/api/watch/${encodeURIComponent(folder)}/${encodeURIComponent(name)}`,
       { method: 'DELETE' }
     );
-    if (r.ok) pollWatch();
+    pollWatch();
   }
 
   async function delOutput(presetName: string, name: string) {
@@ -295,12 +234,17 @@
       alert('Cannot delete — this file is currently being encoded.');
       return;
     }
-    if (!confirm(`Delete ${name}?`)) return;
+    if (!confirm(`Delete output ${name}?`)) return;
     const r = await fetch(
       `/api/delete/${encodeURIComponent(presetName)}/${encodeURIComponent(name)}`,
       { method: 'DELETE' }
     );
-    if (r.ok) pollOutputs();
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      alert(err.detail || 'Delete failed');
+      return;
+    }
+    refreshLists();
   }
 
   function pick(f: File) {
@@ -310,61 +254,88 @@
 
   async function upload() {
     if (!selectedFile) return;
-    if (!preset) {
-      show('Please select a preset.', 'error');
-      return;
-    }
-
     const file = selectedFile;
     uploadActive = true;
     uploadName = file.name;
     uploadPct = 0;
-    uploadSpd = '';
-    uploadEff = '';
-    uploadEta = '';
-    uploadTotalBytes = file.size;
-    uploadConfirmedBytes = 0;
-    uploadChunkTimes = [];
     hide();
-
-    const totalChunks = Math.ceil(file.size / CHUNK) || 1;
     try {
-      for (let i = 0; i < totalChunks; i++) {
-        const rawBlob = file.slice(i * CHUNK, Math.min((i + 1) * CHUNK, file.size));
-        const form = new FormData();
-        form.append('chunk', rawBlob, file.name);
-        form.append('chunk_index', String(i));
-        form.append('total_chunks', String(totalChunks));
-        form.append('filename', file.name);
-        form.append('preset', preset);
-        form.append('compression', 'none');
-        const r = await fetch('/api/upload/chunk', { method: 'POST', body: form });
-        if (!r.ok) {
-          const err = await r.json().catch(() => ({ detail: r.statusText }));
-          throw new Error(err.detail || `HTTP ${r.status}`);
-        }
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          uploadPct = Math.round(((i + 1) / totalChunks) * 100);
-        }
-      }
-      show(`✓ ${file.name} queued under [${preset}]`, 'success');
+      await uploadLibraryFile(file, (pct) => {
+        uploadPct = pct;
+      });
+      show(`✓ ${file.name} added to library`, 'success');
       selectedFile = null;
+      await refreshLists();
     } catch (err) {
       show(`Upload failed: ${(err as Error).message}`, 'error');
+    } finally {
+      uploadActive = false;
     }
   }
 
-  function openCompare() {
-    goto('/compare');
+  async function startJob(source: JobSource, kind: 'encode' | 'preview', key: string) {
+    const preset = presetFor(key);
+    if (!preset) {
+      show('Select a preset first', 'error');
+      return;
+    }
+    busyKey = key + kind;
+    try {
+      const job = await createJob(source, preset, kind);
+      show(
+        kind === 'preview'
+          ? `Preview queued (#${job.id}) with [${preset}]`
+          : `Encode queued (#${job.id}) with [${preset}]`,
+        'success'
+      );
+      await refreshLists();
+      await pollWatch();
+    } catch (err) {
+      show((err as Error).message, 'error');
+    } finally {
+      busyKey = null;
+    }
   }
+
+  async function onCancel(id: number) {
+    if (!confirm(`Cancel job #${id}?`)) return;
+    try {
+      await cancelJob(id);
+      show(`Cancelled #${id}`, 'info');
+      await refreshLists();
+      await pollWatch();
+    } catch (err) {
+      show((err as Error).message, 'error');
+    }
+  }
+
+  async function onDeleteLibrary(id: number, name: string) {
+    if (!confirm(`Delete library file ${name}?`)) return;
+    try {
+      await deleteLibrary(id);
+      await refreshLists();
+    } catch (err) {
+      alert((err as Error).message);
+    }
+  }
+
+  const activeJobs = $derived(
+    jobs.filter((j) =>
+      ['queued', 'encoding', 'previewing', 'extracting'].includes(j.status)
+    )
+  );
 
   onMount(() => {
     connectWS();
     loadPresets();
-    pollQueue();
-    pollOutputs();
+    refreshLists();
     pollWatch();
-    queueTimer = setInterval(pollQueue, 5000);
+    pollLog();
+    pollTimer = setInterval(() => {
+      refreshLists();
+      pollWatch();
+      pollLog();
+    }, 5000);
     fetch('/api/status')
       .then((r) => r.json())
       .then((d) => applySystemStatus(d))
@@ -372,7 +343,7 @@
   });
 
   onDestroy(() => {
-    if (queueTimer) clearInterval(queueTimer);
+    if (pollTimer) clearInterval(pollTimer);
     ws?.close();
   });
 
@@ -389,18 +360,7 @@
 
 <div class="layout">
   <div class="panel panel-left">
-    <h2 class="side-title">Upload File</h2>
-
-    <label for="preset-sel">Preset</label>
-    <select id="preset-sel" bind:value={preset}>
-      {#if !presets.length}
-        <option value="">Loading…</option>
-      {:else}
-        {#each presets as p}
-          <option value={p}>{p}</option>
-        {/each}
-      {/if}
-    </select>
+    <h2 class="side-title">Library upload</h2>
 
     <label>Drag &amp; Drop or Click to Browse</label>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -439,14 +399,9 @@
     <div class="progress-container" class:active={uploadActive}>
       <div class="progress-label">
         <span class="fn">{uploadName}</span>
-        <div class="spd-block">
-          <span class="spd-wire">{uploadSpd}</span>
-          <span class="spd-eff">{uploadEff}</span>
-        </div>
         <span>{uploadPct}%</span>
       </div>
       <div class="bar-track"><div class="bar-fill bar-upload" style="width:{uploadPct}%"></div></div>
-      <div class="prog-sub">{uploadEta}</div>
     </div>
 
     <div
@@ -463,8 +418,8 @@
       <div class="prog-sub">{encSub}</div>
     </div>
 
-    <button class="btn btn-primary" disabled={!selectedFile} onclick={upload}>
-      {selectedFile ? 'Upload' : 'Select a file to upload'}
+    <button class="btn btn-primary" disabled={!selectedFile || uploadActive} onclick={upload}>
+      {selectedFile ? 'Upload to library' : 'Select a file to upload'}
     </button>
 
     {#if statusShow}
@@ -475,84 +430,166 @@
       <div class="cpu-row">
         <span class="cpu-label">CPU</span>
         <div class="cpu-track">
-          <div
-            class="cpu-fill"
-            style="width:{cpuPct ?? 0}%;background:{cpuColor}"
-          ></div>
+          <div class="cpu-fill" style="width:{cpuPct ?? 0}%;background:{cpuColor}"></div>
         </div>
         <span class="cpu-pct">{cpuPct != null ? `${cpuPct}%` : '—'}</span>
       </div>
-      <span class="enc-status">{footerEnc}</span>
+      <span class="enc-status">{footerEnc || (wsConnected ? 'Idle' : 'Offline')}</span>
+    </div>
+
+    <div class="log-mini">
+      <button class="btn btn-ghost log-toggle" onclick={() => (logOpen = !logOpen)}>
+        {logOpen ? 'Hide log' : 'Log'}
+      </button>
+      {#if logOpen}
+        <div class="log-lines">
+          {#each recentLines as line}
+            <div class="log-line">{line}</div>
+          {:else}
+            <div class="empty">No recent activity</div>
+          {/each}
+        </div>
+      {/if}
     </div>
   </div>
 
   <div class="panel-right">
-    <div class="section log-section">
-      <div class="section-hdr">
-        <h2>Activity Log</h2>
-        <div class="hdr-right">
-          <button class="btn btn-ghost" onclick={clearQueue}>Clear</button>
-        </div>
-      </div>
-      <div class="queue-list">
-        {#if !queueLines.length}
-          <div class="empty">No recent activity</div>
-        {:else}
-          {#each queueLines as l}
-            <div class="queue-item">
-              <div class="dot dot-{l.status}"></div>
-              <div>
-                <div class="qi-text">{l.raw}</div>
-                {#if l.progress != null}
-                  <div class="qi-prog">{l.progress.toFixed(1)}%</div>
-                {/if}
+    {#if activeJobs.length}
+      <div class="section">
+        <div class="section-hdr"><h2>In progress</h2></div>
+        <div class="file-list">
+          {#each activeJobs as j}
+            <div class="file-row">
+              <div class="fi-body">
+                <div class="fi-name">
+                  {j.filename}
+                  <span class="badge">{j.kind}</span>
+                  <span class="badge muted">{j.status}</span>
+                </div>
+                <div class="fi-meta">
+                  #{j.id} · {j.preset} · {j.source_label}
+                  {#if j.progress}
+                    · {j.progress.toFixed(0)}%
+                  {/if}
+                </div>
+              </div>
+              <div class="fi-actions">
+                <button class="btn btn-ghost narrow" onclick={() => onCancel(j.id)}>Cancel</button>
               </div>
             </div>
           {/each}
-        {/if}
+        </div>
       </div>
-    </div>
+    {/if}
 
-    <div class="section">
-      <div class="section-hdr"><h2>Watch Queue</h2></div>
-      <div class="watch-list">
-        {#if !watchFiles.length}
-          <div class="empty">No files pending</div>
-        {:else}
+    {#if watchFiles.length}
+      <div class="section">
+        <div class="section-hdr"><h2>Watch queue</h2></div>
+        <div class="file-list">
           {#each watchFiles as f}
-            <div class="watch-item">
-              <div class="wi-body">
-                <div class="wi-name">{f.name}</div>
-                <div class="wi-meta">{f.folder} · {f.size_human}</div>
+            <div class="file-row">
+              <div class="fi-body">
+                <div class="fi-name">{f.display_name || f.name}</div>
+                <div class="fi-meta">{f.folder} · {f.size_human}</div>
               </div>
               <button class="del-btn" onclick={() => delWatch(f.folder, f.name)}>✕</button>
             </div>
           {/each}
+        </div>
+      </div>
+    {/if}
+
+    <div class="section">
+      <div class="section-hdr"><h2>Library</h2></div>
+      <div class="file-list">
+        {#if !library.length}
+          <div class="empty">No library files — upload a video</div>
+        {:else}
+          {#each library as f}
+            {@const key = `lib:${f.id}`}
+            <div class="file-row">
+              <div class="fi-body">
+                <div class="fi-name">{f.original_filename}</div>
+                <div class="fi-meta">{f.size_human} · library #{f.id}</div>
+              </div>
+              <div class="fi-actions">
+                <select
+                  class="preset-mini"
+                  value={presetFor(key)}
+                  onchange={(e) => setPreset(key, (e.currentTarget as HTMLSelectElement).value)}
+                >
+                  {#each presets as p}
+                    <option value={p}>{p}</option>
+                  {/each}
+                </select>
+                <button
+                  class="btn btn-ghost narrow"
+                  disabled={busyKey === key + 'encode'}
+                  onclick={() => startJob({ type: 'library', id: f.id }, 'encode', key)}
+                  >Encode</button
+                >
+                <button
+                  class="btn btn-ghost narrow"
+                  disabled={busyKey === key + 'preview'}
+                  onclick={() => startJob({ type: 'library', id: f.id }, 'preview', key)}
+                  >Preview</button
+                >
+                <a class="dl-btn" href={f.download_url} download>↓</a>
+                <button class="del-btn" onclick={() => onDeleteLibrary(f.id, f.original_filename)}
+                  >✕</button
+                >
+              </div>
+            </div>
+          {/each}
         {/if}
       </div>
     </div>
 
     <div class="section">
       <div class="section-hdr">
-        <h2>Output Files</h2>
-        <button class="btn btn-ghost" onclick={openCompare}>Compare</button>
+        <h2>Encoded outputs</h2>
+        <button class="btn btn-ghost" onclick={() => goto('/compare')}>Compare</button>
       </div>
-      <div class="outputs-list">
+      <div class="file-list">
         {#if !outputs.length}
-          <div class="empty">No output files yet</div>
+          <div class="empty">No encoded outputs yet</div>
         {:else}
           {#each outputs as f}
-            <div class="output-item">
-              <div class="oi-body">
-                <div class="oi-name">
-                  {f.name}
+            {@const key = `job:${f.job_id}`}
+            <div class="file-row">
+              <div class="fi-body">
+                <div class="fi-name">
+                  {f.display_name}
                   {#if currentEncodeFile === f.name}
                     <span class="enc-mark">⚙</span>
                   {/if}
                 </div>
-                <div class="oi-meta">{f.preset} · {f.size_human}</div>
+                <div class="fi-meta">
+                  {f.preset} · {f.size_human} · {f.source_label} · job #{f.job_id}
+                </div>
               </div>
-              <div class="oi-actions">
+              <div class="fi-actions">
+                <select
+                  class="preset-mini"
+                  value={presetFor(key)}
+                  onchange={(e) => setPreset(key, (e.currentTarget as HTMLSelectElement).value)}
+                >
+                  {#each presets as p}
+                    <option value={p}>{p}</option>
+                  {/each}
+                </select>
+                <button
+                  class="btn btn-ghost narrow"
+                  disabled={busyKey === key + 'encode'}
+                  onclick={() => startJob({ type: 'job', id: f.job_id }, 'encode', key)}
+                  >Encode</button
+                >
+                <button
+                  class="btn btn-ghost narrow"
+                  disabled={busyKey === key + 'preview'}
+                  onclick={() => startJob({ type: 'job', id: f.job_id }, 'preview', key)}
+                  >Preview</button
+                >
                 <a class="dl-btn" href={f.download_url} download>↓</a>
                 <button
                   class="del-btn"
@@ -572,88 +609,64 @@
   .layout {
     flex: 1;
     display: grid;
-    grid-template-columns: 400px 1fr;
+    grid-template-columns: 340px 1fr;
     overflow: hidden;
     min-height: 0;
   }
   .panel {
-    padding: 20px;
-    overflow-y: auto;
-  }
-  .panel-left {
+    padding: 16px 18px;
     border-right: 1px solid var(--border);
+    overflow: auto;
     display: flex;
     flex-direction: column;
+    gap: 10px;
   }
   .panel-right {
+    overflow: auto;
+    padding: 12px 16px 24px;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    gap: 14px;
+    min-height: 0;
   }
   .side-title {
-    margin-bottom: 14px;
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
+    margin: 0 0 4px;
+    font-size: 1rem;
   }
   label {
-    display: block;
-    font-size: 12px;
+    font-size: 0.75rem;
     color: var(--muted);
-    margin-bottom: 5px;
-    font-weight: 500;
-  }
-  select {
-    width: 100%;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 9px 12px;
-    border-radius: var(--r);
-    font-size: 14px;
-    margin-bottom: 14px;
-    outline: none;
-  }
-  select:focus {
-    border-color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
   .dropzone {
+    position: relative;
     border: 2px dashed var(--border);
-    border-radius: var(--r);
-    padding: 32px 20px;
+    border-radius: 10px;
+    padding: 28px 12px;
     text-align: center;
     cursor: pointer;
-    position: relative;
-    margin-bottom: 14px;
+    background: var(--panel-2, rgba(255, 255, 255, 0.02));
   }
-  .dropzone.dragover,
-  .dropzone:hover {
+  .dropzone.dragover {
     border-color: var(--accent);
-    background: rgba(108, 99, 255, 0.05);
   }
   .dropzone input {
     position: absolute;
     inset: 0;
     opacity: 0;
     cursor: pointer;
-    width: 100%;
-    height: 100%;
   }
   .dropzone-icon {
-    font-size: 32px;
-    margin-bottom: 8px;
+    font-size: 1.6rem;
+    margin-bottom: 6px;
   }
   .dropzone-text {
+    font-size: 0.85rem;
     color: var(--muted);
-    font-size: 13px;
-  }
-  .dropzone-text :global(strong) {
-    color: var(--text);
+    line-height: 1.4;
   }
   .progress-container {
-    margin-bottom: 10px;
     display: none;
   }
   .progress-container.active {
@@ -663,303 +676,236 @@
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    font-size: 12px;
-    color: var(--muted);
-    margin-bottom: 4px;
-    gap: 6px;
+    font-size: 0.8rem;
+    gap: 8px;
   }
-  .progress-label .fn {
-    flex: 1;
-    min-width: 0;
+  .fn {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--text);
-  }
-  .spd-block {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-  }
-  .spd-wire {
-    color: var(--accent2);
-  }
-  .spd-eff {
-    font-size: 10px;
+    font-weight: 600;
   }
   .bar-track {
-    background: var(--border);
-    border-radius: 99px;
     height: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
     overflow: hidden;
+    margin-top: 4px;
   }
   .bar-fill {
     height: 100%;
-    border-radius: 99px;
-    transition: width 0.3s;
+    border-radius: 4px;
+    transition: width 0.2s;
   }
   .bar-upload {
-    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    background: var(--accent);
   }
   .bar-encode {
-    background: linear-gradient(90deg, var(--warn), var(--success));
-  }
-  .prog-sub {
-    font-size: 11px;
-    color: var(--muted);
-    margin-top: 2px;
+    background: var(--warn);
   }
   .encode-panel {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    padding: 12px 14px;
-    margin-bottom: 14px;
     display: none;
+    padding: 8px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
   }
   .encode-panel.active {
     display: block;
   }
   .encode-panel.flash-green {
-    border-color: var(--success);
-    background: rgba(34, 197, 94, 0.07);
+    border-color: var(--ok, #3dd68c);
   }
   .encode-panel.flash-red {
     border-color: var(--danger);
-    background: rgba(239, 68, 68, 0.07);
+  }
+  .prog-sub {
+    font-size: 0.72rem;
+    color: var(--muted);
+    margin-top: 4px;
   }
   .btn {
-    border: none;
-    padding: 10px 16px;
-    border-radius: var(--r);
-    font-size: 14px;
-    font-weight: 600;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: inherit;
+    border-radius: 6px;
+    padding: 6px 10px;
     cursor: pointer;
-  }
-  .btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+    font-size: 0.8rem;
   }
   .btn-primary {
     background: var(--accent);
-    color: #fff;
-    width: 100%;
-    margin-bottom: 8px;
+    border-color: var(--accent);
+    color: #111;
+    font-weight: 600;
+    padding: 10px;
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .btn-ghost {
     background: transparent;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    padding: 5px 12px;
-    font-size: 12px;
+  }
+  .btn.narrow {
+    padding: 4px 8px;
+    font-size: 0.72rem;
   }
   .status-msg {
-    margin-top: 8px;
-    font-size: 12px;
-    padding: 8px 12px;
+    font-size: 0.8rem;
+    padding: 8px;
     border-radius: 6px;
   }
   .status-msg.success {
-    background: rgba(34, 197, 94, 0.1);
-    color: var(--success);
-    border: 1px solid rgba(34, 197, 94, 0.2);
+    background: rgba(61, 214, 140, 0.12);
   }
   .status-msg.error {
-    background: rgba(239, 68, 68, 0.1);
-    color: var(--danger);
-    border: 1px solid rgba(239, 68, 68, 0.2);
+    background: rgba(255, 90, 90, 0.12);
   }
   .status-msg.info {
-    background: rgba(108, 99, 255, 0.1);
-    color: #a5b4fc;
-    border: 1px solid rgba(108, 99, 255, 0.2);
+    background: rgba(100, 160, 255, 0.12);
   }
   .cpu-footer {
     margin-top: auto;
-    padding-top: 20px;
+    padding-top: 8px;
     border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
   }
   .cpu-row {
     display: flex;
     align-items: center;
-    gap: 10px;
-  }
-  .cpu-label {
-    font-size: 11px;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    gap: 8px;
+    font-size: 0.75rem;
   }
   .cpu-track {
     flex: 1;
-    background: var(--border);
-    border-radius: 99px;
-    height: 6px;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
     overflow: hidden;
   }
   .cpu-fill {
     height: 100%;
-    border-radius: 99px;
-    transition: width 0.6s;
-  }
-  .cpu-pct {
-    font-size: 12px;
-    color: var(--accent2);
-    min-width: 38px;
-    text-align: right;
   }
   .enc-status {
-    font-size: 11px;
+    font-size: 0.7rem;
     color: var(--muted);
-    display: block;
-    margin-top: 6px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .section {
-    padding: 20px;
-    border-bottom: 1px solid var(--border);
-    overflow-y: auto;
+  .log-mini {
+    font-size: 0.7rem;
   }
-  .log-section {
-    max-height: 30vh;
+  .log-toggle {
+    width: 100%;
+    text-align: left;
+    opacity: 0.7;
+  }
+  .log-lines {
+    max-height: 72px;
+    overflow: auto;
+    margin-top: 4px;
+    font-family: ui-monospace, monospace;
+    color: var(--muted);
+  }
+  .log-line {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .section-hdr {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 14px;
+    margin-bottom: 8px;
   }
   .section-hdr h2 {
     margin: 0;
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
+    font-size: 0.95rem;
   }
-  .hdr-right {
-    display: flex;
-    gap: 10px;
-  }
-  .queue-list,
-  .outputs-list,
-  .watch-list {
+  .file-list {
     display: flex;
     flex-direction: column;
     gap: 6px;
   }
-  .queue-item {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    display: flex;
-    gap: 10px;
-  }
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    margin-top: 4px;
-    background: var(--muted);
-  }
-  .dot-encoding {
-    background: var(--warn);
-  }
-  .dot-done {
-    background: var(--success);
-  }
-  .dot-error {
-    background: var(--danger);
-  }
-  .dot-queued {
-    background: var(--accent);
-  }
-  .qi-text {
-    font-size: 12px;
-    word-break: break-all;
-  }
-  .qi-prog {
-    font-size: 11px;
-    color: var(--accent2);
-  }
-  .watch-item,
-  .output-item {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
+  .file-row {
     display: flex;
     align-items: center;
     gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2, rgba(255, 255, 255, 0.02));
   }
-  .wi-body,
-  .oi-body {
+  .fi-body {
     flex: 1;
     min-width: 0;
   }
-  .wi-name,
-  .oi-name {
-    font-size: 13px;
-    white-space: nowrap;
+  .fi-name {
+    font-weight: 600;
+    font-size: 0.88rem;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .wi-meta,
-  .oi-meta {
-    font-size: 11px;
+  .fi-meta {
+    font-size: 0.72rem;
     color: var(--muted);
     margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .oi-actions {
+  .fi-actions {
     display: flex;
-    gap: 6px;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
   }
-  .dl-btn {
-    border: 1px solid var(--accent);
-    color: var(--accent);
-    padding: 5px 12px;
-    border-radius: 6px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-  .del-btn {
-    background: transparent;
+  .preset-mini {
+    max-width: 110px;
+    font-size: 0.7rem;
+    padding: 3px 4px;
+    border-radius: 4px;
     border: 1px solid var(--border);
-    color: var(--muted);
-    padding: 5px 10px;
-    border-radius: 6px;
-    font-size: 12px;
-    cursor: pointer;
+    background: transparent;
+    color: inherit;
   }
-  .del-btn:hover:not(:disabled) {
-    border-color: var(--danger);
+  .dl-btn,
+  .del-btn {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 4px 6px;
+    text-decoration: none;
+  }
+  .del-btn:hover {
     color: var(--danger);
   }
-  .del-btn:disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
+  .badge {
+    display: inline-block;
+    font-size: 0.65rem;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(100, 160, 255, 0.2);
+    margin-left: 6px;
+    font-weight: 500;
+    vertical-align: middle;
   }
-  .empty {
-    text-align: center;
-    color: var(--muted);
-    font-size: 13px;
-    padding: 24px 0;
+  .badge.muted {
+    background: rgba(255, 255, 255, 0.08);
   }
   .enc-mark {
-    font-size: 10px;
-    color: var(--warn);
+    margin-left: 6px;
   }
-  @media (max-width: 768px) {
-    .layout {
-      grid-template-columns: 1fr;
-    }
-    .panel-left {
-      border-right: none;
-      border-bottom: 1px solid var(--border);
-    }
+  .empty {
+    color: var(--muted);
+    font-size: 0.85rem;
+    padding: 12px;
+    text-align: center;
   }
 </style>
