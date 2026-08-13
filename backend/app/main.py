@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import logging
 import re
@@ -25,13 +26,16 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import joinedload
 
 from app.config import (
+    LIBRARY_BASE,
     LOG_FILE,
     MEDIA_BASE,
     OUTPUT_BASE,
     PRESET_MAP,
+    PREVIEW_PAD_FRAMES,
     UPLOAD_TMP,
     WATCH_BASE,
     ensure_dirs,
@@ -39,8 +43,27 @@ from app.config import (
 )
 from app.db import SessionLocal, init_db
 from app.diff import compare_frame_files
-from app.encoder import extract_only, get_current_encode_file
-from app.models import ComparisonFrame, EncodeJob
+from app.encoder import (
+    _encoding_lock,
+    clear_cancel,
+    extract_only,
+    get_current_encode_path,
+    get_current_job_id,
+    request_cancel,
+    run_preview,
+    signal_current_proc,
+)
+from app.frames import (
+    compute_match_noise_graph,
+    compute_preview_noise_score,
+    extract_frame_at_time,
+    preview_meta,
+    preview_window_times,
+    resolve_preview_pair,
+    probe_video,
+)
+from app.models import ComparisonFrame, EncodeJob, LibraryFile
+from app.paths import is_under, ticket_name_for_job, unlink_watch_ticket
 from app.watcher import broadcast_system_loop, broadcast_watch_update, list_watch_files, watch_folders
 from app.ws import manager
 
@@ -91,32 +114,111 @@ def _media_url(path: str | None) -> str | None:
         return None
 
 
-def job_to_dict(job: EncodeJob) -> dict:
+def _source_label(job: EncodeJob, db) -> str:
+    if job.library_file_id:
+        lib = job.library_file or db.get(LibraryFile, job.library_file_id)
+        if lib:
+            return lib.original_filename
+    if job.parent_job_id:
+        parent = job.parent_job or db.get(EncodeJob, job.parent_job_id)
+        if parent:
+            return f"from job #{parent.id} ({parent.preset})"
+        return f"from job #{job.parent_job_id}"
+    return job.filename
+
+
+def _source_size_bytes(job: EncodeJob, db) -> int | None:
+    if job.library_file_id:
+        lib = job.library_file or db.get(LibraryFile, job.library_file_id)
+        if lib and lib.size:
+            return int(lib.size)
+    if job.source_path:
+        try:
+            p = Path(job.source_path)
+            if p.exists():
+                return int(p.stat().st_size)
+        except OSError:
+            pass
+    return None
+
+
+def job_to_dict(job: EncodeJob, db=None) -> dict:
+    close = False
+    if db is None:
+        db = SessionLocal()
+        close = True
+    try:
+        source_size = _source_size_bytes(job, db)
+        output_size = job.output_size
+        compression_ratio = None
+        if source_size and output_size and source_size > 0:
+            # Fraction of original size retained (output/source), e.g. 0.01 ≈ 1/100
+            compression_ratio = round(output_size / source_size, 6)
+
+        return {
+            "id": job.id,
+            "filename": job.filename,
+            "preset": job.preset,
+            "status": job.status,
+            "origin": job.origin,
+            "kind": job.kind,
+            "progress": job.progress,
+            "fps": job.fps,
+            "eta_seconds": job.eta_seconds,
+            "output_size": output_size,
+            "output_size_human": human_size(output_size) if output_size else None,
+            "source_size": source_size,
+            "source_size_human": human_size(source_size) if source_size else None,
+            "compression_ratio": compression_ratio,
+            "error": job.error,
+            "dest_path": job.dest_path,
+            "source_path": job.source_path,
+            "library_file_id": job.library_file_id,
+            "parent_job_id": job.parent_job_id,
+            "source_label": _source_label(job, db),
+            "frame_offset": job.frame_offset,
+            "align_confidence": job.align_confidence,
+            "has_preview_clips": bool(job.source_clip_path and job.dest_clip_path),
+            "noise_score": job.noise_ssim_mean,
+            "noise_ssim_mean": job.noise_ssim_mean,
+            "noise_ssim_std": job.noise_ssim_std,
+            "noise_psnr_mean": job.noise_psnr_mean,
+            "noise_psnr_std": job.noise_psnr_std,
+            "noise_mse_mean": job.noise_mse_mean,
+            "noise_mse_std": job.noise_mse_std,
+            "noise_frame_count": job.noise_frame_count,
+            "encode_duration_seconds": job.encode_duration_seconds,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+            "frames": [
+                {
+                    "id": f.id,
+                    "position": f.position,
+                    "label": f"{int(f.position * 100)}%",
+                    "source_url": _media_url(f.source_png),
+                    "dest_url": _media_url(f.dest_png),
+                }
+                for f in (job.frames or [])
+            ],
+            "download_url": (
+                f"/api/jobs/{job.id}/download"
+                if job.status in ("done", "preview_ready") and job.dest_path
+                else None
+            ),
+        }
+    finally:
+        if close:
+            db.close()
+
+
+def library_to_dict(lib: LibraryFile) -> dict:
     return {
-        "id": job.id,
-        "filename": job.filename,
-        "preset": job.preset,
-        "status": job.status,
-        "origin": job.origin,
-        "progress": job.progress,
-        "fps": job.fps,
-        "eta_seconds": job.eta_seconds,
-        "output_size": job.output_size,
-        "output_size_human": human_size(job.output_size) if job.output_size else None,
-        "error": job.error,
-        "dest_path": job.dest_path,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-        "frames": [
-            {
-                "id": f.id,
-                "position": f.position,
-                "label": f"{int(f.position * 100)}%",
-                "source_url": _media_url(f.source_png),
-                "dest_url": _media_url(f.dest_png),
-            }
-            for f in (job.frames or [])
-        ],
+        "id": lib.id,
+        "original_filename": lib.original_filename,
+        "size": lib.size,
+        "size_human": human_size(lib.size),
+        "created_at": lib.created_at.isoformat() if lib.created_at else None,
+        "download_url": f"/api/library/{lib.id}/download",
     }
 
 
@@ -130,7 +232,6 @@ async def health():
 @app.get("/presets")
 async def get_presets():
     presets = sorted(PRESET_MAP.keys())
-    # Prefer folders that exist on disk
     if WATCH_BASE.exists():
         on_disk = sorted(d.name for d in WATCH_BASE.iterdir() if d.is_dir())
         if on_disk:
@@ -152,15 +253,13 @@ async def websocket_endpoint(ws: WebSocket):
         manager.disconnect(ws)
 
 
-# ── Upload (encode) ────────────────────────────────────────────────────────
-@app.post("/api/upload/chunk")
-@app.post("/upload/chunk")
-async def upload_chunk(
+# ── Library ingest ─────────────────────────────────────────────────────────
+@app.post("/api/library/chunk")
+async def library_chunk(
     chunk: UploadFile = File(...),
     chunk_index: int = Form(...),
     total_chunks: int = Form(...),
     filename: str = Form(...),
-    preset: str = Form(...),
     compression: str = Form("none"),
     compressed: Optional[str] = Form(None),
 ):
@@ -168,11 +267,8 @@ async def upload_chunk(
         if compressed.lower() in ("true", "1", "yes"):
             compression = "gzip"
 
-    if preset not in PRESET_MAP:
-        raise HTTPException(status_code=400, detail=f"Invalid preset: {preset}")
-
     safe_filename = Path(filename).name
-    tmp_path = UPLOAD_TMP / safe_filename
+    tmp_path = UPLOAD_TMP / f"library_{safe_filename}"
 
     chunk_data = await chunk.read()
     wire_bytes = len(chunk_data)
@@ -205,41 +301,470 @@ async def upload_chunk(
     )
 
     if chunk_index == total_chunks - 1:
-        dest_dir = WATCH_BASE / preset
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = dest_dir / safe_filename
-        shutil.move(str(tmp_path), str(dest_path))
-        size = dest_path.stat().st_size
-
+        size = tmp_path.stat().st_size
+        LIBRARY_BASE.mkdir(parents=True, exist_ok=True)
         db = SessionLocal()
         try:
-            job = EncodeJob(
-                filename=safe_filename,
-                preset=preset,
-                status="queued",
-                origin="encode",
-                source_path=str(dest_path),
+            lib = LibraryFile(
+                original_filename=safe_filename,
+                stored_path="",
+                size=size,
             )
-            db.add(job)
+            db.add(lib)
             db.commit()
-            db.refresh(job)
-            job_id = job.id
+            db.refresh(lib)
+            dest = LIBRARY_BASE / f"{lib.id}_{safe_filename}"
+            shutil.move(str(tmp_path), str(dest))
+            lib.stored_path = str(dest)
+            lib.size = dest.stat().st_size
+            db.commit()
+            lib_id = lib.id
         finally:
             db.close()
 
         await manager.broadcast(
             {
-                "type": "upload_complete",
+                "type": "library_upload_complete",
                 "filename": safe_filename,
                 "size": size,
-                "job_id": job_id,
+                "library_id": lib_id,
             }
         )
-        return JSONResponse(
-            {"status": "complete", "dest": str(dest_path), "job_id": job_id}
-        )
+        return JSONResponse({"status": "complete", "id": lib_id})
 
     return JSONResponse({"status": "ok", "chunk": chunk_index, "total": total_chunks})
+
+
+@app.get("/api/library")
+async def list_library():
+    db = SessionLocal()
+    try:
+        rows = db.query(LibraryFile).order_by(LibraryFile.id.desc()).all()
+        return JSONResponse({"files": [library_to_dict(r) for r in rows]})
+    finally:
+        db.close()
+
+
+@app.get("/api/library/{lib_id}/download")
+async def download_library(lib_id: int):
+    db = SessionLocal()
+    try:
+        lib = db.get(LibraryFile, lib_id)
+        if not lib or not lib.stored_path:
+            raise HTTPException(status_code=404, detail="Library file not found")
+        fp = Path(lib.stored_path)
+        if not fp.exists():
+            raise HTTPException(status_code=404, detail="File missing on disk")
+        return FileResponse(str(fp), filename=lib.original_filename)
+    finally:
+        db.close()
+
+
+@app.delete("/api/library/{lib_id}")
+async def delete_library(lib_id: int):
+    db = SessionLocal()
+    try:
+        lib = db.get(LibraryFile, lib_id)
+        if not lib:
+            raise HTTPException(status_code=404, detail="Library file not found")
+        active = (
+            db.query(EncodeJob)
+            .filter(
+                EncodeJob.library_file_id == lib_id,
+                EncodeJob.status.in_(("queued", "encoding", "previewing")),
+            )
+            .count()
+        )
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail="Library file is used by an active job",
+            )
+        fp = Path(lib.stored_path) if lib.stored_path else None
+        db.delete(lib)
+        db.commit()
+        if fp and fp.exists():
+            fp.unlink(missing_ok=True)
+        return JSONResponse({"status": "deleted"})
+    finally:
+        db.close()
+
+
+# ── Create encode / preview job ────────────────────────────────────────────
+class JobSource(BaseModel):
+    type: str  # library | job
+    id: int
+
+
+class CreateJobBody(BaseModel):
+    source: JobSource
+    preset: str
+    kind: str = Field(default="encode")  # encode | preview
+
+
+@app.post("/api/jobs")
+async def create_job(body: CreateJobBody, background_tasks: BackgroundTasks):
+    if body.preset not in PRESET_MAP:
+        raise HTTPException(status_code=400, detail=f"Invalid preset: {body.preset}")
+    if body.kind not in ("encode", "preview"):
+        raise HTTPException(status_code=400, detail="kind must be encode or preview")
+
+    db = SessionLocal()
+    try:
+        library_file_id: int | None = None
+        parent_job_id: int | None = None
+        real_source: Path
+        display_name: str
+
+        if body.source.type == "library":
+            lib = db.get(LibraryFile, body.source.id)
+            if not lib or not lib.stored_path:
+                raise HTTPException(status_code=409, detail="Library file missing")
+            real_source = Path(lib.stored_path)
+            if not real_source.exists():
+                raise HTTPException(status_code=409, detail="Library file missing on disk")
+            library_file_id = lib.id
+            display_name = lib.original_filename
+        elif body.source.type == "job":
+            parent = db.get(EncodeJob, body.source.id)
+            if not parent:
+                raise HTTPException(status_code=409, detail="Parent job not found")
+            # Only finished full encodes can be re-encoded as a source
+            if parent.status != "done" or parent.kind != "encode":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Parent job is not a finished encode",
+                )
+            if not parent.dest_path:
+                raise HTTPException(status_code=409, detail="Parent job has no output")
+            real_source = Path(parent.dest_path)
+            if not real_source.exists():
+                raise HTTPException(status_code=409, detail="Parent output missing on disk")
+            parent_job_id = parent.id
+            display_name = parent.filename
+            library_file_id = parent.library_file_id
+        else:
+            raise HTTPException(status_code=400, detail="source.type must be library or job")
+
+        preset_name, fmt, _extra = PRESET_MAP[body.preset]
+        stem = Path(display_name).stem
+
+        job = EncodeJob(
+            filename=display_name,
+            preset=body.preset,
+            status="queued",
+            origin="encode",
+            kind=body.kind,
+            source_path=str(real_source),
+            library_file_id=library_file_id,
+            parent_job_id=parent_job_id,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        if body.kind == "encode":
+            out_dir = OUTPUT_BASE / body.preset
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = out_dir / f"{stem}.{job.id}.{fmt}"
+            if dest.exists():
+                db.delete(job)
+                db.commit()
+                raise HTTPException(status_code=409, detail="Destination already exists")
+            job.dest_path = str(dest)
+            db.commit()
+
+            ticket = WATCH_BASE / body.preset / ticket_name_for_job(job.id, real_source.suffix)
+            if ticket.exists() or ticket.is_symlink():
+                db.delete(job)
+                db.commit()
+                raise HTTPException(status_code=409, detail="Watch ticket already exists")
+            ticket.symlink_to(real_source)
+            await broadcast_watch_update()
+        else:
+            # preview — no watch ticket; run on encoding lock in background
+            background_tasks.add_task(_run_preview_locked, job.id)
+
+        return JSONResponse(job_to_dict(job, db))
+    finally:
+        db.close()
+
+
+async def _run_preview_locked(job_id: int) -> None:
+    async with _encoding_lock:
+        await run_preview(job_id)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: int):
+    db = SessionLocal()
+    try:
+        job = db.get(EncodeJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if job.status == "queued":
+            # Unlink watch ticket if encode
+            if job.kind == "encode" and job.source_path:
+                suffix = Path(job.source_path).suffix
+                ticket = WATCH_BASE / job.preset / ticket_name_for_job(job.id, suffix)
+                unlink_watch_ticket(ticket, WATCH_BASE)
+            job.status = "cancelled"
+            job.error = "Cancelled"
+            db.commit()
+            await broadcast_watch_update()
+            await manager.broadcast(
+                {"type": "encode_cancelled", "job_id": job_id, "file": job.filename}
+            )
+            return JSONResponse(job_to_dict(job, db))
+
+        if job.status in ("encoding", "previewing"):
+            request_cancel(job_id)
+            await signal_current_proc(job_id)
+            # Status finalized in encoder when proc exits; also force here if idle
+            if get_current_job_id() != job_id:
+                job.status = "cancelled"
+                job.error = "Cancelled"
+                if job.kind == "encode" and job.dest_path:
+                    Path(job.dest_path).unlink(missing_ok=True)
+                if job.kind == "preview":
+                    if job.dest_clip_path:
+                        Path(job.dest_clip_path).unlink(missing_ok=True)
+                    if job.source_clip_path:
+                        Path(job.source_clip_path).unlink(missing_ok=True)
+                if job.kind == "encode" and job.source_path:
+                    suffix = Path(job.source_path).suffix
+                    ticket = WATCH_BASE / job.preset / ticket_name_for_job(job.id, suffix)
+                    unlink_watch_ticket(ticket, WATCH_BASE)
+                db.commit()
+                clear_cancel(job_id)
+            await broadcast_watch_update()
+            return JSONResponse({"status": "cancelling", "job_id": job_id})
+
+        if job.status == "extracting":
+            request_cancel(job_id)
+            job.status = "cancelled"
+            job.error = "Cancelled during extract"
+            db.commit()
+            clear_cancel(job_id)
+            return JSONResponse(job_to_dict(job, db))
+
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot cancel job in status {job.status}",
+        )
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs/{job_id}/download")
+async def download_job_output(job_id: int):
+    db = SessionLocal()
+    try:
+        job = db.get(EncodeJob, job_id)
+        if not job or not job.dest_path:
+            raise HTTPException(status_code=404, detail="Job output not found")
+        if job.kind == "preview":
+            raise HTTPException(status_code=400, detail="Preview clips are not downloadable outputs")
+        fp = Path(job.dest_path)
+        if not fp.exists():
+            raise HTTPException(status_code=404, detail="File missing on disk")
+        # Download as original stem + dest suffix
+        download_name = f"{Path(job.filename).stem}{fp.suffix}"
+        return FileResponse(str(fp), filename=download_name)
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs/{job_id}/preview-frame")
+async def get_preview_frame(job_id: int, index: int = 0, offset: int | None = None):
+    """Return dest[index] paired with source[pad + index + offset].
+
+    Large offsets are residual drift beyond the source-clip pad. When the short
+    source clip cannot cover the requested index, we seek the original
+    library/source file if available.
+    """
+    db = SessionLocal()
+    try:
+        job = db.get(EncodeJob, job_id)
+        if not job or job.kind != "preview":
+            raise HTTPException(status_code=404, detail="Preview job not found")
+        if not job.source_clip_path or not job.dest_clip_path:
+            raise HTTPException(status_code=404, detail="Preview clips not ready")
+        src = Path(job.source_clip_path)
+        dst = Path(job.dest_clip_path)
+        if not src.exists() or not dst.exists():
+            raise HTTPException(status_code=404, detail="Clip files missing")
+
+        off = job.frame_offset if offset is None else offset
+        full_source = Path(job.source_path) if job.source_path else None
+        clip_start: float | None = None
+        if full_source and full_source.exists():
+            try:
+                full_meta = await asyncio.to_thread(probe_video, full_source)
+                _hb_start, _hb_len, usable_abs = preview_window_times(full_meta["duration"])
+                fps = full_meta["fps"] or 30.0
+                clip_start = max(0.0, usable_abs - (PREVIEW_PAD_FRAMES / fps))
+            except Exception:
+                clip_start = None
+
+        def _resolve():
+            return resolve_preview_pair(
+                source_clip=src,
+                dest_clip=dst,
+                index=index,
+                offset=off,
+                full_source=full_source if full_source and full_source.exists() else None,
+                source_clip_start=clip_start,
+            )
+
+        result = await asyncio.to_thread(_resolve)
+        return JSONResponse(
+            {
+                "index": result["index"],
+                "offset": result["offset"],
+                "source_index": result["source_index"],
+                "raw_source_index": result["raw_source_index"],
+                "usable_frame_count": result["usable_frame_count"],
+                "source_frame_count": result["source_frame_count"],
+                "source_oob": result["source_oob"],
+                "source_shortfall": result["source_shortfall"],
+                "used_full_source": result["used_full_source"],
+                "source": base64.b64encode(result["source"]).decode("ascii"),
+                "dest": base64.b64encode(result["dest"]).decode("ascii"),
+            }
+        )
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs/{job_id}/preview-noise")
+async def get_preview_noise(job_id: int):
+    """Noise (MSE) of source-center frame vs every usable dest frame.
+
+    The valley (best_index) is the encoded frame that matches the source
+    center; suggested_offset locks that pair for the whole clip.
+    """
+    db = SessionLocal()
+    try:
+        job = db.get(EncodeJob, job_id)
+        if not job or job.kind != "preview":
+            raise HTTPException(status_code=404, detail="Preview job not found")
+        if not job.source_clip_path or not job.dest_clip_path:
+            raise HTTPException(status_code=404, detail="Preview clips not ready")
+        src = Path(job.source_clip_path)
+        dst = Path(job.dest_clip_path)
+        if not src.exists() or not dst.exists():
+            raise HTTPException(status_code=404, detail="Clip files missing")
+
+        result = await asyncio.to_thread(compute_match_noise_graph, src, dst)
+        return JSONResponse(result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        db.close()
+
+
+@app.post("/api/jobs/{job_id}/preview-diff")
+async def preview_diff(
+    job_id: int,
+    index: int = 0,
+    offset: int | None = None,
+    mode: str = "absdiff",
+):
+    if mode not in ("absdiff", "ssim_map"):
+        raise HTTPException(status_code=400, detail="mode must be absdiff or ssim_map")
+    # Reuse frame endpoint logic then compare in memory
+    frame_resp = await get_preview_frame(job_id, index=index, offset=offset)
+    data = frame_resp.body
+    import json as _json
+
+    payload = _json.loads(data)
+    import tempfile
+
+    from app.diff import compare_frame_files as _cmp
+
+    with tempfile.TemporaryDirectory() as td:
+        sp = Path(td) / "s.png"
+        dp = Path(td) / "d.png"
+        sp.write_bytes(base64.b64decode(payload["source"]))
+        dp.write_bytes(base64.b64decode(payload["dest"]))
+        result = await asyncio.to_thread(_cmp, sp, dp, mode)  # type: ignore[arg-type]
+        return JSONResponse(result)
+
+
+@app.patch("/api/jobs/{job_id}/frame-offset")
+async def set_frame_offset(job_id: int, offset: int = 0):
+    db = SessionLocal()
+    try:
+        job = db.get(EncodeJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job.frame_offset = offset
+        db.commit()
+        return JSONResponse(job_to_dict(job, db))
+    finally:
+        db.close()
+
+
+@app.post("/api/jobs/{job_id}/preview-noise-score")
+async def post_preview_noise_score(job_id: int, offset: int | None = None):
+    """Average SSIM / PSNR / MSE over usable frames at the locked offset."""
+    db = SessionLocal()
+    try:
+        job = db.get(EncodeJob, job_id)
+        if not job or job.kind != "preview":
+            raise HTTPException(status_code=404, detail="Preview job not found")
+        if not job.source_clip_path or not job.dest_clip_path:
+            raise HTTPException(status_code=404, detail="Preview clips not ready")
+        src = Path(job.source_clip_path)
+        dst = Path(job.dest_clip_path)
+        if not src.exists() or not dst.exists():
+            raise HTTPException(status_code=404, detail="Clip files missing")
+
+        off = job.frame_offset if offset is None else offset
+        full_source = Path(job.source_path) if job.source_path else None
+        clip_start: float | None = None
+        if full_source and full_source.exists():
+            try:
+                full_meta = await asyncio.to_thread(probe_video, full_source)
+                _hb_start, _hb_len, usable_abs = preview_window_times(full_meta["duration"])
+                fps = full_meta["fps"] or 30.0
+                clip_start = max(0.0, usable_abs - (PREVIEW_PAD_FRAMES / fps))
+            except Exception:
+                clip_start = None
+
+        def _score():
+            return compute_preview_noise_score(
+                source_clip=src,
+                dest_clip=dst,
+                offset=off,
+                full_source=full_source if full_source and full_source.exists() else None,
+                source_clip_start=clip_start,
+            )
+
+        try:
+            result = await asyncio.to_thread(_score)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        job.frame_offset = off
+        job.noise_ssim_mean = result["ssim_mean"]
+        job.noise_ssim_std = result["ssim_std"]
+        job.noise_psnr_mean = result["psnr_mean"]
+        job.noise_psnr_std = result["psnr_std"]
+        job.noise_mse_mean = result["mse_mean"]
+        job.noise_mse_std = result["mse_std"]
+        job.noise_frame_count = result["frame_count"]
+        from datetime import datetime, timezone
+
+        job.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(job)
+
+        return JSONResponse({**result, "job": job_to_dict(job, db)})
+    finally:
+        db.close()
 
 
 # ── Watch queue ────────────────────────────────────────────────────────────
@@ -252,15 +777,15 @@ async def get_watch_queue():
 @app.delete("/api/watch/{folder}/{filename}")
 @app.delete("/watch/{folder}/{filename}")
 async def delete_watch_file(folder: str, filename: str):
+    """Remove a watch ticket without following the symlink target."""
     safe_filename = Path(filename).name
     fp = WATCH_BASE / folder / safe_filename
-    try:
-        fp.resolve().relative_to(WATCH_BASE.resolve())
-    except ValueError:
+    if not is_under(fp, WATCH_BASE):
         raise HTTPException(status_code=403, detail="Access denied")
-    if not fp.exists():
+    if not fp.exists() and not fp.is_symlink():
         raise HTTPException(status_code=404, detail="File not found")
-    fp.unlink()
+    if not unlink_watch_ticket(fp, WATCH_BASE):
+        raise HTTPException(status_code=403, detail="Access denied")
     await broadcast_watch_update()
     return JSONResponse({"status": "deleted"})
 
@@ -283,7 +808,7 @@ async def get_queue():
             continue
         entry: dict = {"raw": line, "status": "info", "progress": None}
         lo = line.lower()
-        if "encoding" in lo or "encode" in lo:
+        if "encoding" in lo or "encode" in lo or "preview" in lo:
             entry["status"] = "encoding"
         elif "done" in lo or "complete" in lo or "muxing" in lo:
             entry["status"] = "done"
@@ -297,7 +822,7 @@ async def get_queue():
             entry["status"] = "encoding"
         parsed.append(entry)
 
-    return JSONResponse({"lines": parsed})
+    return JSONResponse({"lines": parsed[-12:]})
 
 
 @app.post("/api/queue/clear")
@@ -314,28 +839,40 @@ async def clear_queue():
 @app.get("/api/outputs")
 @app.get("/outputs")
 async def list_outputs():
-    if not OUTPUT_BASE.exists():
-        return JSONResponse({"files": []})
-    files = []
-    for f in OUTPUT_BASE.rglob("*"):
-        if f.is_file() and f.name != ".gitkeep":
-            rel = f.relative_to(OUTPUT_BASE)
-            parts = rel.parts
-            preset = parts[0] if len(parts) > 1 else "unknown"
-            fname = parts[-1]
-            size = f.stat().st_size
+    db = SessionLocal()
+    try:
+        jobs = (
+            db.query(EncodeJob)
+            .filter(
+                EncodeJob.kind == "encode",
+                EncodeJob.status == "done",
+                EncodeJob.dest_path.isnot(None),
+            )
+            .order_by(EncodeJob.id.desc())
+            .all()
+        )
+        files = []
+        for job in jobs:
+            fp = Path(job.dest_path) if job.dest_path else None
+            if not fp or not fp.exists():
+                continue
+            size = fp.stat().st_size
             files.append(
                 {
-                    "name": fname,
-                    "preset": preset,
+                    "job_id": job.id,
+                    "name": fp.name,
+                    "display_name": job.filename,
+                    "preset": job.preset,
                     "size": size,
                     "size_human": human_size(size),
-                    "download_url": f"/download/{preset}/{fname}",
-                    "delete_url": f"/delete/{preset}/{fname}",
+                    "source_label": _source_label(job, db),
+                    "download_url": f"/api/jobs/{job.id}/download",
+                    "delete_url": f"/api/delete/{job.preset}/{fp.name}",
                 }
             )
-    files.sort(key=lambda x: x["name"])
-    return JSONResponse({"files": files})
+        return JSONResponse({"files": files})
+    finally:
+        db.close()
 
 
 @app.get("/api/download/{preset}/{filename}")
@@ -344,46 +881,84 @@ async def download_file(preset: str, filename: str):
     fp = OUTPUT_BASE / preset / filename
     if not fp.exists() or not fp.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    try:
-        fp.resolve().relative_to(OUTPUT_BASE.resolve())
-    except ValueError:
+    if not is_under(fp, OUTPUT_BASE):
         raise HTTPException(status_code=403, detail="Access denied")
-    return FileResponse(str(fp), filename=filename)
+    # Prefer original filename from job
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(EncodeJob)
+            .filter(EncodeJob.dest_path == str(fp))
+            .order_by(EncodeJob.id.desc())
+            .first()
+        )
+        dl_name = f"{Path(job.filename).stem}{fp.suffix}" if job else filename
+    finally:
+        db.close()
+    return FileResponse(str(fp), filename=dl_name)
 
 
 @app.delete("/api/delete/{preset}/{filename}")
 @app.delete("/delete/{preset}/{filename}")
 async def delete_output_file(preset: str, filename: str):
     fp = OUTPUT_BASE / preset / filename
-    try:
-        fp.resolve().relative_to(OUTPUT_BASE.resolve())
-    except ValueError:
+    if not is_under(fp, OUTPUT_BASE):
         raise HTTPException(status_code=403, detail="Access denied")
     if not fp.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    if get_current_encode_file() == filename:
+
+    dest_str = str(fp)
+    current = get_current_encode_path()
+    if current and Path(current).resolve() == fp.resolve():
         raise HTTPException(status_code=409, detail="File is currently encoding")
-    fp.unlink()
-    return JSONResponse({"status": "deleted"})
+
+    db = SessionLocal()
+    try:
+        # Find job owning this dest
+        owner = (
+            db.query(EncodeJob)
+            .filter(EncodeJob.dest_path == dest_str)
+            .order_by(EncodeJob.id.desc())
+            .first()
+        )
+        if owner:
+            child_active = (
+                db.query(EncodeJob)
+                .filter(
+                    EncodeJob.parent_job_id == owner.id,
+                    EncodeJob.status.in_(("queued", "encoding", "previewing")),
+                )
+                .count()
+            )
+            if child_active:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Output is source of an active child job",
+                )
+        fp.unlink()
+        return JSONResponse({"status": "deleted"})
+    finally:
+        db.close()
 
 
 @app.get("/api/status")
 @app.get("/status")
 async def system_status():
-    enc_file = get_current_encode_file()
+    enc_path = get_current_encode_path()
     encoding_size = 0
-    if enc_file:
-        for f in OUTPUT_BASE.rglob(enc_file):
-            if f.is_file():
-                encoding_size = f.stat().st_size
-                break
+    if enc_path:
+        p = Path(enc_path)
+        if p.exists():
+            encoding_size = p.stat().st_size
     return JSONResponse(
         {
             "cpu_pct": None,
-            "encoding": enc_file is not None,
-            "encoding_file": enc_file,
+            "encoding": enc_path is not None,
+            "encoding_file": Path(enc_path).name if enc_path else None,
+            "encoding_path": enc_path,
             "encoding_size": encoding_size,
             "encoding_size_human": human_size(encoding_size) if encoding_size else None,
+            "job_id": get_current_job_id(),
         }
     )
 
@@ -395,12 +970,16 @@ async def list_jobs(limit: int = 50):
     try:
         jobs = (
             db.query(EncodeJob)
-            .options(joinedload(EncodeJob.frames))
+            .options(
+                joinedload(EncodeJob.frames),
+                joinedload(EncodeJob.library_file),
+                joinedload(EncodeJob.parent_job),
+            )
             .order_by(EncodeJob.id.desc())
             .limit(min(limit, 200))
             .all()
         )
-        return JSONResponse({"jobs": [job_to_dict(j) for j in jobs]})
+        return JSONResponse({"jobs": [job_to_dict(j, db) for j in jobs]})
     finally:
         db.close()
 
@@ -411,13 +990,17 @@ async def get_job(job_id: int):
     try:
         job = (
             db.query(EncodeJob)
-            .options(joinedload(EncodeJob.frames))
+            .options(
+                joinedload(EncodeJob.frames),
+                joinedload(EncodeJob.library_file),
+                joinedload(EncodeJob.parent_job),
+            )
             .filter(EncodeJob.id == job_id)
             .first()
         )
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        return JSONResponse(job_to_dict(job))
+        return JSONResponse(job_to_dict(job, db))
     finally:
         db.close()
 
@@ -437,7 +1020,6 @@ async def run_diff(job_id: int, position: float = 0.5, mode: str = "absdiff"):
             .first()
         )
         if not frame:
-            # Allow small float mismatch
             frames = (
                 db.query(ComparisonFrame)
                 .filter(ComparisonFrame.job_id == job_id)
@@ -493,11 +1075,8 @@ async def external_compare_chunk(
     if chunk_index < total_chunks - 1:
         return JSONResponse({"status": "ok", "chunk": chunk_index, "side": side})
 
-    # Finalize this side
     final_path = session_dir / f"{side}_{safe_filename}"
     shutil.move(str(tmp_path), str(final_path))
-
-    # Store filename marker
     (session_dir / f"{side}.name").write_text(safe_filename)
 
     source_name = session_dir / "source.name"
@@ -505,7 +1084,6 @@ async def external_compare_chunk(
     if not (source_name.exists() and dest_name.exists()):
         return JSONResponse({"status": "waiting", "side": side})
 
-    # Both sides ready — create job and extract
     src_final = next(session_dir.glob("source_*"), None)
     dst_final = next(session_dir.glob("dest_*"), None)
     if not src_final or not dst_final:
@@ -518,6 +1096,7 @@ async def external_compare_chunk(
             preset="external",
             status="queued",
             origin="external",
+            kind="encode",
             source_path=str(src_final),
             dest_path=str(dst_final),
         )
