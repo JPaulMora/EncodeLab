@@ -2,6 +2,7 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import {
+    computePreviewNoiseScore,
     fetchJob,
     fetchJobs,
     fetchPreviewFrame,
@@ -67,8 +68,51 @@
   let selectionStart = $state(0);
   let selectionEnd = $state(0);
   let noiseScaleMax = $state(1);
+  let scoreBusy = $state(false);
+  let scoreError = $state('');
 
   const isPreview = $derived(job?.kind === 'preview' && job?.status === 'preview_ready');
+
+  function truncate(s: string, max: number): string {
+    if (s.length <= max) return s;
+    return `${s.slice(0, Math.max(0, max - 1))}…`;
+  }
+
+  function formatDuration(secs: number | null | undefined): string {
+    if (secs == null || !Number.isFinite(secs)) return '—';
+    const s = Math.max(0, Math.round(secs));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    if (m >= 60) {
+      const h = Math.floor(m / 60);
+      return `${h}h ${m % 60}m`;
+    }
+    if (m > 0) return `${m}m ${r}s`;
+    return `${r}s`;
+  }
+
+  function formatNoise(j: EncodeJob): string {
+    if (j.noise_ssim_mean == null) return '—';
+    const m = j.noise_ssim_mean;
+    const std = j.noise_ssim_std;
+    if (std != null && std > 0) return `${m.toFixed(3)}±${std.toFixed(3)}`;
+    return m.toFixed(3);
+  }
+
+  function formatCompression(j: EncodeJob): string {
+    if (j.compression_ratio == null || j.compression_ratio <= 0) return '—';
+    const r = j.compression_ratio; // output / source
+    const inv = 1 / r;
+    if (inv >= 2) return `1/${Math.round(inv)}`;
+    return r.toFixed(3);
+  }
+
+  function jobMetaLine(j: EncodeJob): string {
+    const parts = [`${j.kind}`, j.preset, j.status];
+    if (j.source_label) parts.push(j.source_label);
+    if (j.frames?.length) parts.push(`${j.frames.length} frames`);
+    return parts.join(' · ');
+  }
 
   const currentFrame = $derived(
     job?.frames.find((f) => Math.abs(f.position - position) < 0.01) ?? null
@@ -89,9 +133,9 @@
       return `Source is short by ${sourceShortfall} frame(s) at the end — showing last available source frame.`;
     }
     if (usedFullSource) {
-      return `Browsing with offset ${frameOffset >= 0 ? '+' : ''}${frameOffset}: source frame ${rawSourceIndex} (from original file).`;
+      return `Browsing with offset ${frameOffset >= 0 ? '+' : ''}${frameOffset}: source past clip pad — frame from original file.`;
     }
-    return `Browsing with offset ${frameOffset >= 0 ? '+' : ''}${frameOffset}: source index = dest index + offset.`;
+    return `Browsing with offset ${frameOffset >= 0 ? '+' : ''}${frameOffset}: source = pad + dest + offset.`;
   });
 
   async function loadJobs() {
@@ -121,14 +165,26 @@
     noiseBestIndex = null;
     noiseSuggestedOffset = null;
     noiseError = '';
+    sceneCuts = [];
+    selectionStart = 0;
+    selectionEnd = 0;
+    noiseScaleMax = 1;
     offsetLocked = false;
+    sourceOob = false;
+    sourceShortfall = 0;
+    usedFullSource = false;
     job = await fetchJob(id);
     frameOffset = job.frame_offset ?? 0;
+    offsetInput = String(frameOffset);
     frameIndex = 0;
     frameInput = '0';
     if (job.kind === 'preview' && job.status === 'preview_ready') {
-      await loadPreviewPair();
       await loadNoiseGraph();
+      if (noiseBestIndex != null) {
+        frameIndex = noiseBestIndex;
+        frameInput = String(noiseBestIndex);
+      }
+      await loadPreviewPair();
       await runDiff();
     } else if (job.frames.length) {
       const hasPos = job.frames.some((f) => Math.abs(f.position - position) < 0.01);
@@ -144,6 +200,10 @@
       const r = await fetchPreviewFrame(job.id, frameIndex, frameOffset);
       maxFrames = Math.max(1, r.usable_frame_count - 1);
       frameInput = String(frameIndex);
+      sourceOob = r.source_oob;
+      sourceShortfall = r.source_shortfall;
+      usedFullSource = r.used_full_source;
+      rawSourceIndex = r.raw_source_index;
       previewSourceUrl = `data:image/png;base64,${r.source}`;
       previewDestUrl = `data:image/png;base64,${r.dest}`;
       await renderFromUrls(previewSourceUrl, previewDestUrl);
@@ -161,7 +221,15 @@
       noiseValues = r.values;
       noiseBestIndex = r.best_index;
       noiseSuggestedOffset = r.suggested_offset;
+      sceneCuts = r.scene_cuts ?? [];
+      selectionStart = r.selection_start ?? 0;
+      selectionEnd = r.selection_end ?? Math.max(0, r.frame_count - 1);
+      noiseScaleMax = r.scale_max || 1;
       maxFrames = Math.max(maxFrames, r.frame_count - 1);
+      if (!offsetLocked && r.suggested_offset != null) {
+        frameOffset = r.suggested_offset;
+        offsetInput = String(r.suggested_offset);
+      }
     } catch (e) {
       noiseError = (e as Error).message;
       noiseValues = [];
@@ -202,6 +270,7 @@
     frameIndex = capped;
     frameInput = String(capped);
     await loadPreviewPair();
+    await runDiff();
   }
 
   async function onFrameScrub(v: number) {
@@ -217,12 +286,21 @@
     await goToFrame(n);
   }
 
-  async function onOffsetChange(v: number) {
-    if (offsetLocked) return;
-    frameOffset = v;
+  async function onOffsetInputCommit() {
+    if (offsetLocked) {
+      offsetInput = String(frameOffset);
+      return;
+    }
+    const n = Number(offsetInput);
+    if (!Number.isFinite(n)) {
+      offsetInput = String(frameOffset);
+      return;
+    }
+    frameOffset = Math.round(n);
+    offsetInput = String(frameOffset);
     if (job) {
       try {
-        await setFrameOffset(job.id, v);
+        await setFrameOffset(job.id, frameOffset);
       } catch {
         /* keep local */
       }
@@ -230,25 +308,60 @@
     await loadPreviewPair();
   }
 
-  async function jumpToBestMatch() {
-    if (noiseBestIndex == null) return;
-    await goToFrame(noiseBestIndex);
+  async function applySuggestedOffset() {
+    if (noiseSuggestedOffset == null) return;
+    frameOffset = noiseSuggestedOffset;
+    offsetInput = String(frameOffset);
+    if (job) {
+      try {
+        await setFrameOffset(job.id, frameOffset);
+      } catch {
+        /* keep local */
+      }
+    }
+    if (noiseBestIndex != null) await goToFrame(noiseBestIndex);
+    else await loadPreviewPair();
   }
 
-  async function lockOffsetFromNoise() {
-    if (!job || noiseSuggestedOffset == null || noiseBestIndex == null) return;
-    frameOffset = noiseSuggestedOffset;
+  async function runNoiseScore() {
+    if (!job || !isPreview) return;
+    scoreBusy = true;
+    scoreError = '';
+    try {
+      const r = await computePreviewNoiseScore(job.id, frameOffset);
+      job = r.job;
+      jobs = jobs.map((j) => (j.id === r.job.id ? r.job : j));
+    } catch (e) {
+      scoreError = (e as Error).message;
+    } finally {
+      scoreBusy = false;
+    }
+  }
+
+  async function lockOffset() {
+    if (!job) return;
+    const n = Number(offsetInput);
+    if (Number.isFinite(n)) {
+      frameOffset = Math.round(n);
+      offsetInput = String(frameOffset);
+    }
     offsetLocked = true;
     try {
       await setFrameOffset(job.id, frameOffset);
     } catch {
       /* keep local */
     }
-    await goToFrame(noiseBestIndex);
+    if (noiseBestIndex != null) await goToFrame(noiseBestIndex);
+    else await loadPreviewPair();
   }
 
   function unlockOffset() {
     offsetLocked = false;
+  }
+
+  async function jumpToBestMatch() {
+    if (noiseBestIndex == null) return;
+    await goToFrame(noiseBestIndex);
   }
 
   async function runDiff() {
@@ -374,16 +487,26 @@
             class:active={selectedId === j.id}
             onclick={() => selectJob(j.id)}
           >
-            <div class="job-name">{j.filename}</div>
-            <div class="job-meta">
-              {j.kind} · {j.preset} · {j.status}
-              {#if j.source_label}
-                · {j.source_label}
-              {/if}
-              {#if j.frames?.length}
-                · {j.frames.length} frames
-              {/if}
+            <div class="job-item-main">
+              <div class="job-name" title={j.filename}>{truncate(j.filename, 30)}</div>
+              <div class="job-meta" title={jobMetaLine(j)}>{truncate(jobMetaLine(j), 100)}</div>
             </div>
+            <table class="job-stats">
+              <tbody>
+                <tr>
+                  <th>Compression</th>
+                  <td>{formatCompression(j)}</td>
+                </tr>
+                <tr>
+                  <th>Noise</th>
+                  <td>{formatNoise(j)}</td>
+                </tr>
+                <tr>
+                  <th>Encode</th>
+                  <td>{formatDuration(j.encode_duration_seconds)}</td>
+                </tr>
+              </tbody>
+            </table>
           </button>
         {/each}
       {/if}
@@ -418,13 +541,180 @@
     {:else}
       {#if isPreview}
         <section class="preview-controls">
+          <div class="control-block noise-block">
+            <div class="control-head">
+              <h3>1. Match noise</h3>
+              <p class="help">
+                Source <strong>center frame</strong> vs every encoded frame. Lowest point =
+                best match. Scene changes (big jumps) are detected and the selection window
+                is cut there so outliers don’t blow the scale or pick the wrong valley.
+              </p>
+            </div>
+            {#if noiseBusy}
+              <div class="noise-loading">Computing noise graph…</div>
+            {:else if noiseError}
+              <div class="err">{noiseError}</div>
+            {:else if noiseValues.length}
+              <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+              <div
+                class="noise-graph"
+                onclick={(e) => {
+                  const el = e.currentTarget as HTMLElement;
+                  const rect = el.getBoundingClientRect();
+                  const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  const idx = Math.round(x * (noiseValues.length - 1));
+                  goToFrame(idx);
+                }}
+              >
+                <svg
+                  viewBox={`0 0 ${Math.max(1, noiseValues.length - 1)} 100`}
+                  preserveAspectRatio="none"
+                >
+                  {#if selectionEnd > selectionStart}
+                    <rect
+                      class="sel-band"
+                      x={selectionStart}
+                      y="0"
+                      width={Math.max(1, selectionEnd - selectionStart)}
+                      height="100"
+                    />
+                  {/if}
+                  <polyline
+                    class="noise-out"
+                    fill="none"
+                    stroke-width="1.2"
+                    vector-effect="non-scaling-stroke"
+                    points={noiseValues
+                      .map((v, i) => {
+                        const clipped = Number.isFinite(v)
+                          ? Math.min(v, noiseMax * 1.05)
+                          : noiseMax;
+                        const y = 100 - (clipped / noiseMax) * 92 - 4;
+                        return `${i},${y}`;
+                      })
+                      .join(' ')}
+                  />
+                  {#each sceneCuts as cut}
+                    <line class="cut-line" x1={cut} x2={cut} y1="0" y2="100" />
+                  {/each}
+                  {#if noiseBestIndex != null}
+                    <line
+                      class="best-line"
+                      x1={noiseBestIndex}
+                      x2={noiseBestIndex}
+                      y1="0"
+                      y2="100"
+                    />
+                  {/if}
+                  <line
+                    class="cursor-line"
+                    x1={frameIndex}
+                    x2={frameIndex}
+                    y1="0"
+                    y2="100"
+                  />
+                </svg>
+                <div class="noise-legend">
+                  <span>Green band = selection (same scene)</span>
+                  {#if noiseBestIndex != null}
+                    <span>Best: frame {noiseBestIndex}</span>
+                  {/if}
+                  {#if sceneCuts.length}
+                    <span>{sceneCuts.length} scene cut(s)</span>
+                  {/if}
+                </div>
+              </div>
+              <div class="noise-actions">
+                <button
+                  class="btn btn-ghost"
+                  disabled={noiseBestIndex == null}
+                  onclick={jumpToBestMatch}>Jump to best match</button
+                >
+                <button
+                  class="btn btn-ghost"
+                  disabled={noiseSuggestedOffset == null}
+                  onclick={applySuggestedOffset}
+                >
+                  Use suggested offset
+                  {#if noiseSuggestedOffset != null}
+                    ({noiseSuggestedOffset >= 0 ? `+${noiseSuggestedOffset}` : noiseSuggestedOffset})
+                  {/if}
+                </button>
+              </div>
+            {:else}
+              <button class="btn btn-ghost" onclick={loadNoiseGraph}>Load noise graph</button>
+            {/if}
+          </div>
+
           <div class="control-block">
             <div class="control-head">
-              <h3>Frame</h3>
+              <h3>2. Offset</h3>
               <p class="help">
-                Scrub through the encoded preview clip. Type a frame number or drag the wide
-                slider. Overlay / abs-diff use this frame against the source at the current
-                offset.
+                <code>source = pad + dest + offset</code>. Aligned ≈ 0; type any integer for
+                residual drift (missing frames). Suggested value pairs source center with the
+                best-match encoded frame. Lock when happy — then scrub with that pairing.
+              </p>
+            </div>
+            <div class="offset-row">
+              <input
+                class="offset-num"
+                type="number"
+                step="1"
+                bind:value={offsetInput}
+                disabled={offsetLocked}
+                onchange={onOffsetInputCommit}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') onOffsetInputCommit();
+                }}
+              />
+              <span class="offset-val">frames</span>
+              {#if !offsetLocked}
+                <button class="btn btn-primary narrow" onclick={lockOffset}>Lock offset</button>
+              {:else}
+                <span class="align-badge">locked</span>
+                <button class="btn btn-ghost" onclick={unlockOffset}>Unlock</button>
+              {/if}
+            </div>
+            {#if offsetLocked && offsetNote}
+              <p class="help oob-note">{offsetNote}</p>
+            {/if}
+            <div class="score-row">
+              <button
+                class="btn btn-primary narrow"
+                disabled={!offsetLocked || scoreBusy}
+                onclick={runNoiseScore}
+              >
+                {scoreBusy ? 'Scoring…' : 'Compute noise score for this preview'}
+              </button>
+              {#if job?.noise_ssim_mean != null}
+                <span class="score-summary">
+                  SSIM {job.noise_ssim_mean.toFixed(4)}±{(job.noise_ssim_std ?? 0).toFixed(4)}
+                  · PSNR {job.noise_psnr_mean != null ? `${job.noise_psnr_mean.toFixed(2)} dB` : '—'}
+                  · MSE {job.noise_mse_mean != null ? job.noise_mse_mean.toFixed(1) : '—'}
+                  · n={job.noise_frame_count ?? '—'}
+                </span>
+              {/if}
+            </div>
+            {#if scoreError}
+              <div class="err">{scoreError}</div>
+            {/if}
+            {#if !offsetLocked}
+              <p class="help">Lock offset first, then score every usable frame at that pairing.</p>
+            {/if}
+          </div>
+
+          <div class="control-block">
+            <div class="control-head">
+              <h3>3. Browse frames</h3>
+              <p class="help">
+                {#if offsetLocked}
+                  Offset is locked — scrub the full encoded preview. Source follows as
+                  <code>pad + dest + {frameOffset >= 0 ? '+' : ''}{frameOffset}</code>. If one
+                  side runs out of frames at the start/end, we clamp and show a note above.
+                {:else}
+                  Scrub to inspect pairs before locking. Prefer locking first so browsing
+                  stays aligned across the clip.
+                {/if}
               </p>
             </div>
             <div class="frame-row">
@@ -449,120 +739,6 @@
                 />
                 <span class="frame-max">/ {maxFrames}</span>
               </div>
-            </div>
-          </div>
-
-          <div class="control-block noise-block">
-            <div class="control-head">
-              <h3>Match noise</h3>
-              <p class="help">
-                One fixed frame from the <strong>center of the source snippet</strong> is
-                compared to <strong>every frame</strong> of the encoded preview. The valley
-                (lowest noise) is the matching encoded frame — lock that to set the offset for
-                the whole clip.
-              </p>
-            </div>
-            {#if noiseBusy}
-              <div class="noise-loading">Computing noise graph…</div>
-            {:else if noiseError}
-              <div class="err">{noiseError}</div>
-            {:else if noiseValues.length}
-              <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-              <div
-                class="noise-graph"
-                onclick={(e) => {
-                  const el = e.currentTarget as HTMLElement;
-                  const rect = el.getBoundingClientRect();
-                  const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                  const idx = Math.round(x * (noiseValues.length - 1));
-                  goToFrame(idx);
-                }}
-              >
-                <svg viewBox={`0 0 ${Math.max(1, noiseValues.length - 1)} 100`} preserveAspectRatio="none">
-                  <polyline
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                    vector-effect="non-scaling-stroke"
-                    points={noiseValues
-                      .map((v, i) => {
-                        const y = Number.isFinite(v) ? 100 - (v / noiseMax) * 92 - 4 : 100;
-                        return `${i},${y}`;
-                      })
-                      .join(' ')}
-                  />
-                  {#if noiseBestIndex != null}
-                    <line
-                      class="best-line"
-                      x1={noiseBestIndex}
-                      x2={noiseBestIndex}
-                      y1="0"
-                      y2="100"
-                    />
-                  {/if}
-                  <line
-                    class="cursor-line"
-                    x1={frameIndex}
-                    x2={frameIndex}
-                    y1="0"
-                    y2="100"
-                  />
-                </svg>
-                <div class="noise-legend">
-                  <span>Low noise = match</span>
-                  {#if noiseBestIndex != null}
-                    <span>Best: frame {noiseBestIndex}</span>
-                  {/if}
-                  <span>Click graph to jump</span>
-                </div>
-              </div>
-              <div class="noise-actions">
-                <button class="btn btn-ghost" disabled={noiseBestIndex == null} onclick={jumpToBestMatch}
-                  >Jump to best match</button
-                >
-                <button
-                  class="btn btn-primary narrow"
-                  disabled={noiseSuggestedOffset == null}
-                  onclick={lockOffsetFromNoise}
-                >
-                  Lock offset
-                  {#if noiseSuggestedOffset != null}
-                    ({noiseSuggestedOffset >= 0 ? `+${noiseSuggestedOffset}` : noiseSuggestedOffset})
-                  {/if}
-                </button>
-                {#if offsetLocked}
-                  <span class="align-badge">offset locked</span>
-                  <button class="btn btn-ghost" onclick={unlockOffset}>Unlock</button>
-                {/if}
-              </div>
-            {:else}
-              <button class="btn btn-ghost" onclick={loadNoiseGraph}>Load noise graph</button>
-            {/if}
-          </div>
-
-          <div class="control-block">
-            <div class="control-head">
-              <h3>Source offset</h3>
-              <p class="help">
-                Shifts which source frame pairs with the current encoded frame (±12). Use
-                overlay at ~50% — when edges stop ghosting, you’re synced. Prefer
-                <strong>Lock offset</strong> from the noise graph when the valley is clear.
-              </p>
-            </div>
-            <div class="offset-row">
-              <input
-                class="offset-range"
-                type="range"
-                min="-12"
-                max="12"
-                value={frameOffset}
-                disabled={offsetLocked}
-                oninput={(e) =>
-                  onOffsetChange(Number((e.currentTarget as HTMLInputElement).value))}
-              />
-              <span class="offset-val"
-                >{frameOffset >= 0 ? `+${frameOffset}` : frameOffset} frames</span
-              >
             </div>
           </div>
         </section>
@@ -679,7 +855,7 @@
   .compare {
     flex: 1;
     display: grid;
-    grid-template-columns: 280px 1fr;
+    grid-template-columns: 340px 1fr;
     min-height: 0;
     overflow: hidden;
   }
@@ -736,6 +912,9 @@
     gap: 6px;
   }
   .job-item {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
     text-align: left;
     background: var(--bg);
     border: 1px solid var(--border);
@@ -748,6 +927,10 @@
     border-color: var(--accent);
     background: rgba(108, 99, 255, 0.1);
   }
+  .job-item-main {
+    flex: 1;
+    min-width: 0;
+  }
   .job-name {
     font-size: 13px;
     white-space: nowrap;
@@ -758,6 +941,39 @@
     font-size: 11px;
     color: var(--muted);
     margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .job-stats {
+    flex: 0 0 auto;
+    border-collapse: collapse;
+    font-size: 10px;
+    line-height: 1.35;
+    color: var(--muted);
+  }
+  .job-stats th {
+    font-weight: 500;
+    text-align: right;
+    padding: 0 6px 0 0;
+    white-space: nowrap;
+  }
+  .job-stats td {
+    text-align: left;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .score-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+  .score-summary {
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
   }
   .preview-controls {
     display: flex;
@@ -816,20 +1032,28 @@
     color: var(--muted);
   }
   .offset-row {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
     align-items: center;
   }
-  .offset-range {
-    width: 100%;
-    height: 24px;
+  .offset-num {
+    width: 96px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: inherit;
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
   }
   .offset-val {
     font-size: 13px;
     font-variant-numeric: tabular-nums;
-    min-width: 6.5em;
-    text-align: right;
+    color: var(--muted);
+  }
+  .oob-note {
+    color: var(--warn, #f5a524) !important;
   }
   .noise-graph {
     position: relative;
@@ -846,10 +1070,23 @@
     width: 100%;
     height: 100%;
   }
+  .noise-graph .sel-band {
+    fill: rgba(61, 214, 140, 0.12);
+  }
+  .noise-graph .noise-out {
+    stroke: currentColor;
+    opacity: 0.95;
+  }
+  .noise-graph .cut-line {
+    stroke: var(--danger, #ef4444);
+    stroke-width: 1;
+    stroke-dasharray: 2 2;
+    vector-effect: non-scaling-stroke;
+    opacity: 0.7;
+  }
   .noise-graph .best-line {
     stroke: var(--ok, #3dd68c);
-    stroke-width: 1;
-    stroke-dasharray: 3 2;
+    stroke-width: 1.5;
     vector-effect: non-scaling-stroke;
   }
   .noise-graph .cursor-line {
