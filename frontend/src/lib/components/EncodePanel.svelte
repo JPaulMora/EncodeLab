@@ -267,17 +267,27 @@
     return files ? Array.from(files) : [];
   }
 
+  function fileKey(f: File) {
+    return `${f.name}:${f.size}:${f.lastModified}`;
+  }
+
   function filesFromDrop(dt: DataTransfer | null): File[] {
     if (!dt) return [];
-    const fromFiles = filesFromList(dt.files);
-    if (fromFiles.length) return fromFiles;
-    const fromItems: File[] = [];
+    const seen = new Set<string>();
+    const out: File[] = [];
+    const add = (f: File | null) => {
+      if (!f) return;
+      const key = fileKey(f);
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(f);
+    };
+    // Prefer items: on macOS, dataTransfer.files often contains only the last file.
     for (const item of Array.from(dt.items || [])) {
-      if (item.kind !== 'file') continue;
-      const f = item.getAsFile();
-      if (f) fromItems.push(f);
+      if (item.kind === 'file') add(item.getAsFile());
     }
-    return fromItems;
+    for (const f of Array.from(dt.files || [])) add(f);
+    return out;
   }
 
   function addFiles(files: FileList | File[]) {
@@ -302,6 +312,24 @@
     }
     pending = next;
     hide();
+  }
+
+  async function pickWithFilePicker() {
+    try {
+      const handles = await showOpenFilePicker({ multiple: true });
+      const files = await Promise.all(handles.map((h) => h.getFile()));
+      addFiles(files);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      show((err as Error).message, 'error');
+    }
+  }
+
+  function onBrowseClick(e: MouseEvent) {
+    // Chromium's hidden-input .click() opens a single-file NSOpenPanel on macOS.
+    if (typeof showOpenFilePicker !== 'function') return;
+    e.preventDefault();
+    void pickWithFilePicker();
   }
 
   function removePending(id: number) {
@@ -444,30 +472,18 @@
   <div class="panel panel-left">
     <h2 class="side-title">Library upload</h2>
 
-    <label>Drag &amp; drop or click to browse</label>
-    <input
-      bind:this={filePicker}
-      class="file-picker"
-      type="file"
-      multiple
-      onchange={(e) => {
-        const input = e.currentTarget as HTMLInputElement;
-        if (input.files?.length) addFiles(input.files);
-        input.value = '';
-      }}
-    />
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div
+    <span class="field-label">Drag &amp; drop or click to browse</span>
+    <label
       class="dropzone"
       class:dragover
-      role="button"
+      for="library-files"
       tabindex="0"
-      onclick={() => filePicker?.click()}
+      onclick={onBrowseClick}
       onkeydown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          filePicker?.click();
-        }
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        if (typeof showOpenFilePicker === 'function') void pickWithFilePicker();
+        else filePicker?.click();
       }}
       ondragenter={(e) => {
         e.preventDefault();
@@ -487,6 +503,18 @@
         if (dropped.length) addFiles(dropped);
       }}
     >
+      <input
+        id="library-files"
+        bind:this={filePicker}
+        class="file-picker"
+        type="file"
+        multiple={true}
+        onchange={(e) => {
+          const input = e.currentTarget as HTMLInputElement;
+          if (input.files?.length) addFiles(input.files);
+          input.value = '';
+        }}
+      />
       <div class="dropzone-icon">📁</div>
       <div class="dropzone-text">
         {#if pending.length}
@@ -496,7 +524,7 @@
           <strong>Drop videos here</strong><br />or click to browse (Shift/Cmd-click several)
         {/if}
       </div>
-    </div>
+    </label>
 
     {#if pending.length}
       <div class="pending">
@@ -804,7 +832,8 @@
     margin: 0 0 4px;
     font-size: 1rem;
   }
-  label {
+  label:not(.dropzone),
+  .field-label {
     font-size: 0.75rem;
     color: var(--muted);
     text-transform: uppercase;
@@ -812,6 +841,7 @@
   }
   .dropzone {
     position: relative;
+    display: block;
     border: 2px dashed var(--border);
     border-radius: 10px;
     padding: 28px 12px;
@@ -824,14 +854,11 @@
   }
   .file-picker {
     position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    /* Drops must hit the label, not the input — macOS file inputs keep only the last file. */
     pointer-events: none;
   }
   .dropzone-icon {
