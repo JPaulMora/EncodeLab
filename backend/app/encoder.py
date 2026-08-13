@@ -28,7 +28,7 @@ from app.frames import (
     preview_window_times,
     probe_video,
 )
-from app.models import ComparisonFrame, EncodeJob
+from app.models import ComparisonFrame, EncodeJob, LibraryFile
 from app.paths import parse_job_id_from_ticket, unlink_watch_ticket
 from app.ws import manager
 
@@ -94,6 +94,72 @@ async def signal_current_proc(job_id: int) -> bool:
 
 def _touch(job: EncodeJob) -> None:
     job.updated_at = datetime.now(timezone.utc)
+
+
+def _path_size(path: Path | str | None) -> int | None:
+    if not path:
+        return None
+    try:
+        n = Path(path).stat().st_size
+        return n if n > 0 else None
+    except OSError:
+        return None
+
+
+def compute_compression_ratio(
+    source_path: Path | str | None,
+    dest_path: Path | str | None,
+    *,
+    source_size: int | None = None,
+    dest_size: int | None = None,
+    normalize_duration: bool = False,
+) -> float | None:
+    """Output size ÷ source size. Preview clips are scaled to full-file duration."""
+    src = Path(source_path) if source_path else None
+    dst = Path(dest_path) if dest_path else None
+    out_n = dest_size if dest_size and dest_size > 0 else _path_size(dst)
+    src_n = source_size if source_size and source_size > 0 else _path_size(src)
+    if not out_n or not src_n:
+        return None
+    if normalize_duration and src and dst and src.exists() and dst.exists():
+        try:
+            src_dur = float(probe_video(src)["duration"] or 0)
+            dst_dur = float(probe_video(dst)["duration"] or 0)
+            if src_dur > 0 and dst_dur > 0:
+                estimated_full = out_n * (src_dur / dst_dur)
+                return round(estimated_full / src_n, 6)
+        except Exception:
+            log.debug("compression duration-normalize failed", exc_info=True)
+    return round(out_n / src_n, 6)
+
+
+def persist_job_metrics(
+    job: EncodeJob,
+    db,
+    dest_path: Path,
+    *,
+    dest_size: int | None = None,
+    encode_secs: float | None = None,
+    normalize_duration: bool = False,
+) -> None:
+    size = dest_size
+    if size is None:
+        size = dest_path.stat().st_size if dest_path.exists() else 0
+    job.output_size = size
+    if encode_secs is not None:
+        job.encode_duration_seconds = round(encode_secs, 2)
+    src_size = None
+    if job.library_file_id:
+        lib = job.library_file or db.get(LibraryFile, job.library_file_id)
+        if lib and lib.size:
+            src_size = int(lib.size)
+    job.compression_ratio = compute_compression_ratio(
+        job.source_path,
+        dest_path,
+        source_size=src_size,
+        dest_size=size,
+        normalize_duration=normalize_duration,
+    )
 
 
 def _handbrake_import_args(preset_name: str) -> list[str]:
@@ -351,8 +417,7 @@ async def run_encode(folder: str, infile_path: Path, job_id: int | None = None) 
 
         size = out_path.stat().st_size if out_path.exists() else 0
         job.progress = 100.0
-        job.output_size = size
-        job.encode_duration_seconds = round(encode_secs, 2)
+        persist_job_metrics(job, db, out_path, dest_size=size, encode_secs=encode_secs)
         job.status = "extracting"
         _touch(job)
         db.commit()
@@ -577,8 +642,13 @@ async def run_preview(job_id: int) -> None:
             job.error = f"Align failed: {exc}"
 
         job.progress = 100.0
-        job.output_size = dest_clip.stat().st_size if dest_clip.exists() else 0
-        job.encode_duration_seconds = round(encode_secs, 2)
+        persist_job_metrics(
+            job,
+            db,
+            dest_clip,
+            encode_secs=encode_secs,
+            normalize_duration=True,
+        )
         job.status = "preview_ready"
         _touch(job)
         db.commit()
@@ -640,6 +710,7 @@ async def extract_only(job_id: int, source_path: Path, dest_path: Path) -> None:
                     dest_png=str(dst_png),
                 )
             )
+        persist_job_metrics(job, db, dest_path)
         job.status = "done"
         _touch(job)
         db.commit()

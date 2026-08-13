@@ -36,7 +36,8 @@
       'Output size ÷ source size. 1/10 means the encode is ~10× smaller. Lower (higher 1/N) is more compression; “good” depends on the preset.',
     noise:
       'Mean SSIM across scored frames (0–1, 1 = identical). ≥0.98 excellent · 0.95–0.98 typical good encode. ± is frame-to-frame spread — a large ± often means leftover misalignment.',
-    encode: 'HandBrake wall-clock time for this job. Not a quality metric.'
+    encode: 'HandBrake wall-clock time for this job. Not a quality metric.',
+    offset: 'Locked source↔dest frame offset for this comparison. Restored when you reopen the job.'
   } as const;
 
   let jobs = $state<EncodeJob[]>([]);
@@ -129,6 +130,12 @@
     const inv = 1 / r;
     if (inv >= 2) return `1/${Math.round(inv)}`;
     return r.toFixed(3);
+  }
+
+  function formatOffset(j: EncodeJob): string {
+    const n = j.frame_offset ?? 0;
+    const sign = n > 0 ? '+' : '';
+    return j.offset_locked ? `${sign}${n} locked` : `${sign}${n}`;
   }
 
   function jobMetaLine(j: EncodeJob): string {
@@ -243,6 +250,7 @@
     job = await fetchJob(id);
     frameOffset = job.frame_offset ?? 0;
     offsetInput = String(frameOffset);
+    offsetLocked = Boolean(job.offset_locked);
     frameIndex = 0;
     frameInput = '0';
     if (job.kind === 'preview' && job.status === 'preview_ready') {
@@ -304,10 +312,6 @@
       maxFrames = Math.max(maxFrames, r.frame_count - 1);
 
       const stillAtStart = frameIndex === startFrame && frameOffset === startOffset;
-      if (!offsetLocked && r.suggested_offset != null && stillAtStart) {
-        frameOffset = r.suggested_offset;
-        offsetInput = String(r.suggested_offset);
-      }
       if (opts.autoJump && stillAtStart && r.best_index != null) {
         await goToFrame(r.best_index);
       }
@@ -380,6 +384,17 @@
     await goToFrame(n);
   }
 
+  async function persistOffset(locked?: boolean) {
+    if (!job) return;
+    try {
+      const updated = await setFrameOffset(job.id, frameOffset, locked);
+      job = updated;
+      jobs = jobs.map((j) => (j.id === updated.id ? updated : j));
+    } catch {
+      /* keep local */
+    }
+  }
+
   async function onOffsetInputCommit() {
     if (offsetLocked) {
       offsetInput = String(frameOffset);
@@ -392,13 +407,7 @@
     }
     frameOffset = Math.round(n);
     offsetInput = String(frameOffset);
-    if (job) {
-      try {
-        await setFrameOffset(job.id, frameOffset);
-      } catch {
-        /* keep local */
-      }
-    }
+    await persistOffset();
     await loadPreviewPair();
   }
 
@@ -406,13 +415,7 @@
     if (noiseSuggestedOffset == null) return;
     frameOffset = noiseSuggestedOffset;
     offsetInput = String(frameOffset);
-    if (job) {
-      try {
-        await setFrameOffset(job.id, frameOffset);
-      } catch {
-        /* keep local */
-      }
-    }
+    await persistOffset();
     if (noiseBestIndex != null) await goToFrame(noiseBestIndex);
     else await loadPreviewPair();
   }
@@ -444,17 +447,14 @@
       offsetInput = String(frameOffset);
     }
     offsetLocked = true;
-    try {
-      await setFrameOffset(job.id, frameOffset);
-    } catch {
-      /* keep local */
-    }
+    await persistOffset(true);
     if (noiseBestIndex != null) await goToFrame(noiseBestIndex);
     else await loadPreviewPair();
   }
 
-  function unlockOffset() {
+  async function unlockOffset() {
     offsetLocked = false;
+    await persistOffset(false);
   }
 
   async function jumpToBestMatch() {
@@ -601,6 +601,10 @@
                   <tr>
                     <th title={METRIC_HINTS.encode}>Encode</th>
                     <td title={METRIC_HINTS.encode}>{formatDuration(j.encode_duration_seconds)}</td>
+                  </tr>
+                  <tr>
+                    <th title={METRIC_HINTS.offset}>Offset</th>
+                    <td title={METRIC_HINTS.offset}>{formatOffset(j)}</td>
                   </tr>
                 </tbody>
               </table>

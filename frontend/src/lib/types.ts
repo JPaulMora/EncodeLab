@@ -27,6 +27,7 @@ export type EncodeJob = {
   parent_job_id: number | null;
   source_label: string;
   frame_offset: number;
+  offset_locked: boolean;
   align_confidence: number | null;
   has_preview_clips: boolean;
   noise_score: number | null;

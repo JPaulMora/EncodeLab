@@ -227,9 +227,9 @@ def job_to_dict(job: EncodeJob, db=None) -> dict:
     try:
         source_size = _source_size_bytes(job, db)
         output_size = job.output_size
-        compression_ratio = None
-        if source_size and output_size and source_size > 0:
-            # Fraction of original size retained (output/source), e.g. 0.01 ≈ 1/100
+        compression_ratio = job.compression_ratio
+        if compression_ratio is None and source_size and output_size and source_size > 0:
+            # Legacy rows from before the stored column
             compression_ratio = round(output_size / source_size, 6)
 
         return {
@@ -254,6 +254,7 @@ def job_to_dict(job: EncodeJob, db=None) -> dict:
             "parent_job_id": job.parent_job_id,
             "source_label": _source_label(job, db),
             "frame_offset": job.frame_offset,
+            "offset_locked": bool(job.offset_locked),
             "align_confidence": job.align_confidence,
             "has_preview_clips": bool(job.source_clip_path and job.dest_clip_path),
             "noise_score": job.noise_ssim_mean,
@@ -808,7 +809,7 @@ async def preview_diff(
 
 
 @app.patch("/api/jobs/{job_id}/frame-offset")
-async def set_frame_offset(job_id: int, offset: int = 0):
+async def set_frame_offset(job_id: int, offset: int = 0, locked: bool | None = None):
     db = SessionLocal()
     try:
         job = db.get(EncodeJob, job_id)
@@ -816,8 +817,19 @@ async def set_frame_offset(job_id: int, offset: int = 0):
             raise HTTPException(status_code=404, detail="Job not found")
         prev = job.frame_offset
         job.frame_offset = offset
+        if locked is not None:
+            job.offset_locked = locked
+        from datetime import datetime, timezone
+
+        job.updated_at = datetime.now(timezone.utc)
         db.commit()
-        log.info("frame-offset job=%s %s → %s", job_id, prev, offset)
+        log.info(
+            "frame-offset job=%s %s → %s locked=%s",
+            job_id,
+            prev,
+            offset,
+            job.offset_locked,
+        )
         return JSONResponse(job_to_dict(job, db))
     finally:
         db.close()

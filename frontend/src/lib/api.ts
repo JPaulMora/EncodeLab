@@ -164,8 +164,14 @@ export async function runPreviewDiff(
   return r.json();
 }
 
-export async function setFrameOffset(jobId: number, offset: number): Promise<EncodeJob> {
-  const r = await fetch(`/api/jobs/${jobId}/frame-offset?offset=${offset}`, {
+export async function setFrameOffset(
+  jobId: number,
+  offset: number,
+  locked?: boolean
+): Promise<EncodeJob> {
+  const params = new URLSearchParams({ offset: String(offset) });
+  if (locked != null) params.set('locked', locked ? 'true' : 'false');
+  const r = await fetch(`/api/jobs/${jobId}/frame-offset?${params}`, {
     method: 'PATCH'
   });
   if (!r.ok) {

@@ -58,6 +58,9 @@ class EncodeJob(Base):
         ForeignKey("encode_jobs.id", ondelete="SET NULL"), nullable=True
     )
     frame_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    offset_locked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     align_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     source_clip_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     dest_clip_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -70,6 +73,7 @@ class EncodeJob(Base):
     noise_mse_std: Mapped[float | None] = mapped_column(Float, nullable=True)
     noise_frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     encode_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    compression_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     keep_tracks: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )
