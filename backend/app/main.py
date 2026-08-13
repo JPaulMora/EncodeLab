@@ -79,7 +79,7 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Re-apply after uvicorn/alembic may have reset logging
+    # Re-apply after uvicorn may have reset logging
     setup_logging(LOG_FILE)
     ensure_dirs()
     log.info(
@@ -89,6 +89,8 @@ async def lifespan(app: FastAPI):
         MEDIA_BASE,
     )
     init_db()
+    # Alembic reconfigures logging — restore console handlers
+    setup_logging(LOG_FILE)
     log.info("DB ready")
     asyncio.create_task(watch_folders())
     asyncio.create_task(broadcast_system_loop())

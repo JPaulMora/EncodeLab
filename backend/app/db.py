@@ -47,8 +47,12 @@ def init_db() -> None:
     from pathlib import Path
 
     from app import models  # noqa: F401
+    from app.logging_config import setup_logging
+    from app.config import LOG_FILE
 
     ini = Path(__file__).resolve().parent.parent / "alembic.ini"
     cfg = Config(str(ini))
     cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
     command.upgrade(cfg, "head")
+    # Alembic mutates the global logging config — put console logs back
+    setup_logging(LOG_FILE)
