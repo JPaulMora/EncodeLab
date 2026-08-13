@@ -1,4 +1,4 @@
-.PHONY: up down logs api frontend install
+.PHONY: up down logs api frontend install makemigrations migrate
 
 up:
 	docker compose up --build -d
@@ -18,3 +18,9 @@ frontend:
 install:
 	cd backend && pip install -r requirements.txt
 	cd frontend && npm install
+
+makemigrations:
+	docker compose exec api alembic revision --autogenerate -m "$(or $(m),auto)"
+
+migrate:
+	docker compose exec api alembic upgrade head

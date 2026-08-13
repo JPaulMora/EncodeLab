@@ -41,6 +41,14 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
+    """Run Alembic migrations to head (preferred over create_all)."""
+    from alembic import command
+    from alembic.config import Config
+    from pathlib import Path
+
     from app import models  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
+    ini = Path(__file__).resolve().parent.parent / "alembic.ini"
+    cfg = Config(str(ini))
+    cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
+    command.upgrade(cfg, "head")

@@ -6,8 +6,10 @@ Built by merging the encoder dashboard and Bitrate Buddy comparator into one Fas
 
 ## Features
 
-- **Encode** — upload videos, pick a HandBrake preset, watch live progress over WebSocket
-- **Compare** — after encode, view source vs dest frames at 25% / 50% / 75% of the timeline
+- **Library** — upload videos once (no preset); browse and re-use sources
+- **Encode** — pick a library file or prior output + HandBrake preset; watch-ticket queue
+- **Preview** — short HandBrake range around 25% with auto frame-align before a full encode
+- **Compare** — source vs dest stills (full encode) or scrubbed preview clips with offset
 - Overlay with opacity, side-by-side, abs-diff, and server SSIM / heatmap maps
 - **External compare** — upload source + encoded pair when encoding happened elsewhere
 
@@ -43,7 +45,11 @@ Open http://localhost:5173 (Vite proxies `/api` and `/ws` to :8000).
 
 ```bash
 make up
+make makemigrations m="description"   # after model changes
+make migrate
 ```
+
+Data lives in the `encoder_data` named volume under `/data` (`library/`, `watch/`, `output/`).
 
 ## Layout
 
