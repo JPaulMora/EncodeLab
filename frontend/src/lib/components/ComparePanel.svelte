@@ -25,6 +25,20 @@
 
   const POSITIONS = [0.25, 0.5, 0.75] as const;
 
+  const METRIC_HINTS = {
+    ssim:
+      'Structural similarity of this frame pair. Range 0–1 (1 = identical). Higher is better. ≥0.98 excellent · 0.95–0.98 typical good encode · 0.90–0.95 visible loss · <0.90 often misaligned or a very aggressive preset.',
+    psnr:
+      'Peak signal-to-noise from MSE, in dB. Range 0–∞ (∞ = identical). Higher is better. ≥40 dB excellent · 35–40 good · 30–35 typical lossy · <30 visible damage or frames not aligned.',
+    mse:
+      'Mean squared pixel error on 8-bit color (0–65025). 0 = identical. Lower is better. <10 excellent · 10–40 typical lossy · 40–200 noticeable · hundreds+ usually means the frames are not aligned.',
+    compression:
+      'Output size ÷ source size. 1/10 means the encode is ~10× smaller. Lower (higher 1/N) is more compression; “good” depends on the preset.',
+    noise:
+      'Mean SSIM across scored frames (0–1, 1 = identical). ≥0.98 excellent · 0.95–0.98 typical good encode. ± is frame-to-frame spread — a large ± often means leftover misalignment.',
+    encode: 'HandBrake wall-clock time for this job. Not a quality metric.'
+  } as const;
+
   let jobs = $state<EncodeJob[]>([]);
   let selectedId = $state<number | null>(null);
   let job = $state<EncodeJob | null>(null);
@@ -577,16 +591,16 @@
               <table class="job-stats">
                 <tbody>
                   <tr>
-                    <th>Compression</th>
-                    <td>{formatCompression(j)}</td>
+                    <th title={METRIC_HINTS.compression}>Compression</th>
+                    <td title={METRIC_HINTS.compression}>{formatCompression(j)}</td>
                   </tr>
                   <tr>
-                    <th>Noise</th>
-                    <td>{formatNoise(j)}</td>
+                    <th title={METRIC_HINTS.noise}>Noise</th>
+                    <td title={METRIC_HINTS.noise}>{formatNoise(j)}</td>
                   </tr>
                   <tr>
-                    <th>Encode</th>
-                    <td>{formatDuration(j.encode_duration_seconds)}</td>
+                    <th title={METRIC_HINTS.encode}>Encode</th>
+                    <td title={METRIC_HINTS.encode}>{formatDuration(j.encode_duration_seconds)}</td>
                   </tr>
                 </tbody>
               </table>
@@ -808,6 +822,13 @@
                 </span>
               {/if}
             </div>
+            {#if job?.noise_ssim_mean != null}
+              <p class="help">
+                Mean ± std across {job.noise_frame_count ?? 'n'} aligned preview frames — same
+                SSIM / PSNR / MSE scales as below. Low std means consistent quality; a large
+                ± often means leftover misalignment.
+              </p>
+            {/if}
             {#if scoreError}
               <div class="err">{scoreError}</div>
             {/if}
@@ -954,16 +975,35 @@
             {busy ? 'Running…' : 'Run'}
           </button>
         </div>
-        {#if mse != null && ssim != null}
-          <div class="metrics">
-            <div class="metric"><span class="metric-label">SSIM</span> {ssim.toFixed(4)}</div>
-            <div class="metric">
-              <span class="metric-label">PSNR</span>
-              {psnr != null ? `${psnr.toFixed(2)} dB` : '∞'}
+        <div class="metrics">
+          <div class="metric">
+            <div class="metric-value">
+              <span class="metric-label">SSIM</span>
+              {ssim != null ? ssim.toFixed(4) : '—'}
             </div>
-            <div class="metric"><span class="metric-label">MSE</span> {mse.toFixed(2)}</div>
+            <p class="metric-hint">{METRIC_HINTS.ssim}</p>
           </div>
-        {/if}
+          <div class="metric">
+            <div class="metric-value">
+              <span class="metric-label">PSNR</span>
+              {#if mse == null}
+                —
+              {:else if psnr != null}
+                {psnr.toFixed(2)} dB
+              {:else}
+                ∞
+              {/if}
+            </div>
+            <p class="metric-hint">{METRIC_HINTS.psnr}</p>
+          </div>
+          <div class="metric">
+            <div class="metric-value">
+              <span class="metric-label">MSE</span>
+              {mse != null ? mse.toFixed(2) : '—'}
+            </div>
+            <p class="metric-hint">{METRIC_HINTS.mse}</p>
+          </div>
+        </div>
         <div class="server-maps">
           <figure class="map-pane">
             <figcaption>Absdiff heatmap</figcaption>
@@ -1468,12 +1508,14 @@
   .metrics {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 14px;
     margin: 14px 0;
+    color: var(--text);
+  }
+  .metric-value {
     font-size: 18px;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
-    color: var(--text);
     line-height: 1.35;
   }
   .metric-label {
@@ -1481,6 +1523,14 @@
     min-width: 4.5em;
     color: var(--accent2);
     font-weight: 700;
+  }
+  .metric-hint {
+    margin: 4px 0 0;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.45;
+    color: var(--muted);
+    max-width: 52em;
   }
   .empty {
     text-align: center;
