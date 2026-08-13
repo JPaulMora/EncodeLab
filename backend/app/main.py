@@ -65,6 +65,7 @@ from app.frames import (
     resolve_preview_pair,
     probe_video,
 )
+from app.logging_config import setup_logging
 from app.models import ComparisonFrame, EncodeJob, LibraryFile
 from app.paths import is_under, ticket_name_for_job, unlink_watch_ticket
 from app.watcher import broadcast_system_loop, broadcast_watch_update, list_watch_files, watch_folders
@@ -72,37 +73,26 @@ from app.ws import manager
 
 # ── Logging ────────────────────────────────────────────────────────────────
 ensure_dirs()
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE),
-    ],
-    force=True,
-)
-# Keep third-party noise down; our app packages stay INFO
-logging.getLogger("uvicorn").setLevel(logging.INFO)
-logging.getLogger("uvicorn.access").setLevel(logging.INFO)
-logging.getLogger("uvicorn.error").setLevel(logging.INFO)
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-logging.getLogger("watchfiles").setLevel(logging.WARNING)
+setup_logging(LOG_FILE)
 log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Re-apply after uvicorn/alembic may have reset logging
+    setup_logging(LOG_FILE)
     ensure_dirs()
-    init_db()
     log.info(
         "API starting — watch=%s output=%s media=%s",
         WATCH_BASE,
         OUTPUT_BASE,
         MEDIA_BASE,
     )
+    init_db()
+    log.info("DB ready")
     asyncio.create_task(watch_folders())
     asyncio.create_task(broadcast_system_loop())
+    log.info("Background watcher + system broadcast started")
     yield
     log.info("API shutting down")
 
