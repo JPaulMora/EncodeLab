@@ -60,6 +60,7 @@
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let dragover = $state(false);
   let pendingId = 0;
+  let filePicker: HTMLInputElement | undefined;
 
   const VIDEO_EXT =
     /\.(mp4|mkv|avi|mov|m4v|mpg|mpeg|wmv|flv|webm|ts|mts|m2ts)$/i;
@@ -262,8 +263,25 @@
     return VIDEO_EXT.test(f.name);
   }
 
+  function filesFromList(files: FileList | File[] | null | undefined): File[] {
+    return files ? Array.from(files) : [];
+  }
+
+  function filesFromDrop(dt: DataTransfer | null): File[] {
+    if (!dt) return [];
+    const fromFiles = filesFromList(dt.files);
+    if (fromFiles.length) return fromFiles;
+    const fromItems: File[] = [];
+    for (const item of Array.from(dt.items || [])) {
+      if (item.kind !== 'file') continue;
+      const f = item.getAsFile();
+      if (f) fromItems.push(f);
+    }
+    return fromItems;
+  }
+
   function addFiles(files: FileList | File[]) {
-    const list = Array.from(files).filter(isVideoFile);
+    const list = filesFromList(files).filter(isVideoFile);
     if (!list.length) {
       show('No video files in that selection', 'error');
       return;
@@ -427,38 +445,55 @@
     <h2 class="side-title">Library upload</h2>
 
     <label>Drag &amp; drop or click to browse</label>
+    <input
+      bind:this={filePicker}
+      class="file-picker"
+      type="file"
+      multiple
+      onchange={(e) => {
+        const input = e.currentTarget as HTMLInputElement;
+        if (input.files?.length) addFiles(input.files);
+        input.value = '';
+      }}
+    />
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       class="dropzone"
       class:dragover
+      role="button"
+      tabindex="0"
+      onclick={() => filePicker?.click()}
+      onkeydown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          filePicker?.click();
+        }
+      }}
+      ondragenter={(e) => {
+        e.preventDefault();
+        dragover = true;
+      }}
       ondragover={(e) => {
         e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
         dragover = true;
       }}
       ondragleave={() => (dragover = false)}
       ondrop={(e) => {
         e.preventDefault();
+        e.stopPropagation();
         dragover = false;
-        if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+        const dropped = filesFromDrop(e.dataTransfer);
+        if (dropped.length) addFiles(dropped);
       }}
     >
-      <input
-        type="file"
-        multiple={true}
-        accept=".mkv,.mp4,.avi,.mov,.m4v,.mpg,.mpeg,.ts,.m2ts,.wmv,.mts,.webm"
-        onchange={(e) => {
-          const input = e.currentTarget as HTMLInputElement;
-          if (input.files?.length) addFiles(input.files);
-          input.value = '';
-        }}
-      />
       <div class="dropzone-icon">📁</div>
       <div class="dropzone-text">
         {#if pending.length}
           <strong>{pending.length} video{pending.length === 1 ? '' : 's'} queued</strong><br />
           drop or click to add more
         {:else}
-          <strong>Drop videos here</strong><br />or click to browse (select several at once)
+          <strong>Drop videos here</strong><br />or click to browse (Shift/Cmd-click several)
         {/if}
       </div>
     </div>
@@ -787,11 +822,17 @@
   .dropzone.dragover {
     border-color: var(--accent);
   }
-  .dropzone input {
+  .file-picker {
     position: absolute;
-    inset: 0;
-    opacity: 0;
-    cursor: pointer;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+    pointer-events: none;
   }
   .dropzone-icon {
     font-size: 1.6rem;
