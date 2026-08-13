@@ -80,6 +80,33 @@ def ssim_disparity_map(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return cv2.applyColorMap(dissim_u8, cv2.COLORMAP_INFERNO)
 
 
+def _metrics_only(a: np.ndarray, b: np.ndarray) -> dict:
+    a, b = align_sizes(a, b)
+    mse = compute_mse(a, b)
+    ssim_score = compute_ssim(a, b)
+    psnr = compute_psnr(mse)
+    return {
+        "mse": mse,
+        "ssim": ssim_score,
+        "psnr": psnr if psnr != float("inf") else None,
+    }
+
+
+def compare_png_bytes(source_png: bytes, dest_png: bytes) -> dict:
+    """SSIM / PSNR / MSE for in-memory PNG pair (no map image)."""
+    if len(source_png) > MAX_DECODED_BYTES or len(dest_png) > MAX_DECODED_BYTES:
+        raise ValueError("Image too large")
+    a = cv2.imdecode(np.frombuffer(source_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    b = cv2.imdecode(np.frombuffer(dest_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if a is None or b is None:
+        raise ValueError("Could not decode image")
+    if a.shape[1] > MAX_DIMENSION or a.shape[0] > MAX_DIMENSION:
+        raise ValueError("Image dimensions too large")
+    if b.shape[1] > MAX_DIMENSION or b.shape[0] > MAX_DIMENSION:
+        raise ValueError("Image dimensions too large")
+    return _metrics_only(a, b)
+
+
 def compare_frame_files(
     source_png: Path,
     dest_png: Path,
@@ -89,9 +116,7 @@ def compare_frame_files(
     b = _load_png(dest_png)
     a, b = align_sizes(a, b)
 
-    mse = compute_mse(a, b)
-    ssim_score = compute_ssim(a, b)
-    psnr = compute_psnr(mse)
+    metrics = _metrics_only(a, b)
 
     if mode == "ssim_map":
         result = ssim_disparity_map(a, b)
@@ -100,7 +125,5 @@ def compare_frame_files(
 
     return {
         "image": encode_image_b64(result),
-        "mse": mse,
-        "ssim": ssim_score,
-        "psnr": psnr if psnr != float("inf") else None,
+        **metrics,
     }
