@@ -1136,7 +1136,7 @@
     transition: opacity 160ms ease;
   }
   .job-item:hover .job-item-actions,
-  .job-item:focus-within .job-item-actions {
+  .job-item-actions:focus-within {
     opacity: 1;
     pointer-events: auto;
   }
