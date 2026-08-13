@@ -444,8 +444,8 @@
     >
       <input
         type="file"
-        multiple
-        accept="video/*,.mkv,.mp4,.avi,.mov,.m4v,.mpg,.mpeg,.ts,.m2ts,.wmv,.mts,.webm"
+        multiple={true}
+        accept=".mkv,.mp4,.avi,.mov,.m4v,.mpg,.mpeg,.ts,.m2ts,.wmv,.mts,.webm"
         onchange={(e) => {
           const input = e.currentTarget as HTMLInputElement;
           if (input.files?.length) addFiles(input.files);
@@ -458,7 +458,7 @@
           <strong>{pending.length} video{pending.length === 1 ? '' : 's'} queued</strong><br />
           drop or click to add more
         {:else}
-          <strong>Drop videos here</strong><br />or click to browse
+          <strong>Drop videos here</strong><br />or click to browse (select several at once)
         {/if}
       </div>
     </div>
