@@ -71,7 +71,7 @@ export type CapturedFrame = {
   height: number;
 };
 
-export type CompareMode = 'side-by-side' | 'overlay' | 'abs-diff';
+export type CompareMode = 'side-by-side' | 'overlay' | 'abs-diff' | 'subtract';
 export type ServerDiffMode = 'absdiff' | 'ssim_map';
 
 export type JobSource =
