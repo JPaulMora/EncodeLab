@@ -274,7 +274,7 @@ async def run_encode(job_id: int) -> None:
         _current_proc = proc
 
         t0 = time.monotonic()
-        await _read_handbrake_progress(proc, job, db, job_id, display)
+        hb_tail = await _read_handbrake_progress(proc, job, db, job_id, display)
         await proc.wait()
         encode_secs = time.monotonic() - t0
         _current_proc = None
@@ -293,9 +293,14 @@ async def run_encode(job_id: int) -> None:
             return
 
         if proc.returncode != 0:
-            log.error("FAILED: %s (exit %s)", display, proc.returncode)
+            last = next((ln for ln in reversed(hb_tail.splitlines()) if ln), "")
+            log.error("FAILED: %s (exit %s) %s", display, proc.returncode, last or hb_tail)
             job.status = "failed"
-            job.error = f"HandBrake exit {proc.returncode}"
+            job.error = (
+                f"HandBrake exit {proc.returncode}: {last}"
+                if last
+                else f"HandBrake exit {proc.returncode}"
+            )
             _touch(job)
             db.commit()
             await manager.broadcast(
@@ -374,9 +379,10 @@ async def _read_handbrake_progress(
     db,
     job_id: int,
     display_name: str,
-) -> None:
+) -> str:
     last_pct = -1.0
     buf = b""
+    tail: list[str] = []
     while True:
         if is_cancel_requested(job_id):
             break
@@ -396,6 +402,10 @@ async def _read_handbrake_progress(
                 continue
             if not line:
                 continue
+            if "%" not in line:
+                tail.append(line)
+                if len(tail) > 16:
+                    tail = tail[-16:]
             lo = line.lower()
             if any(k in lo for k in ("error", "warning")) and "%" not in line:
                 log.warning(line)
@@ -438,7 +448,7 @@ async def _read_handbrake_progress(
                     "file": display_name,
                 }
             )
-
+    return "\n".join(tail)
 
 
 async def run_preview(job_id: int) -> None:
@@ -535,7 +545,7 @@ async def run_preview(job_id: int) -> None:
         )
         _current_proc = proc
         t0 = time.monotonic()
-        await _read_handbrake_progress(proc, job, db, job_id, job.filename)
+        hb_tail = await _read_handbrake_progress(proc, job, db, job_id, job.filename)
         await proc.wait()
         encode_secs = time.monotonic() - t0
         _current_proc = None
@@ -554,8 +564,13 @@ async def run_preview(job_id: int) -> None:
             return
 
         if proc.returncode != 0:
+            last = next((ln for ln in reversed(hb_tail.splitlines()) if ln), "")
             job.status = "failed"
-            job.error = f"HandBrake preview exit {proc.returncode}"
+            job.error = (
+                f"HandBrake preview exit {proc.returncode}: {last}"
+                if last
+                else f"HandBrake preview exit {proc.returncode}"
+            )
             _touch(job)
             db.commit()
             await manager.broadcast(
