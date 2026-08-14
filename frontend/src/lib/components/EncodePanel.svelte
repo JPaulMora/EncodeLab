@@ -8,6 +8,8 @@
     fetchJobs,
     fetchLibrary,
     fetchOutputs,
+    pauseEncodeQueue,
+    resumeEncodeQueue,
     uploadLibraryFile
   } from '$lib/api';
   import type { EncodeJob, JobSource, LibraryFile, OutputFile } from '$lib/types';
@@ -50,6 +52,7 @@
   let jobs = $state<EncodeJob[]>([]);
   let currentEncodeFile = $state<string | null>(null);
   let hasLiveProgress = $state(false);
+  let queuePaused = $state(false);
 
   /** Per-row preset pickers keyed by `lib:id` or `job:id` */
   let rowPreset = $state<Record<string, string>>({});
@@ -184,6 +187,9 @@
         encodeActive = false;
         refreshLists();
         break;
+      case 'queue_paused':
+        queuePaused = Boolean(msg.paused);
+        break;
       case 'system':
         applySystemStatus(msg);
         break;
@@ -209,6 +215,7 @@
 
   function applySystemStatus(msg: Record<string, unknown>) {
     if (msg.cpu_pct != null) cpuPct = Number(msg.cpu_pct);
+    if (msg.queue_paused != null) queuePaused = Boolean(msg.queue_paused);
     if (msg.encoding) {
       if (!hasLiveProgress) currentEncodeFile = String(msg.encoding_file || '');
       footerEnc = String(msg.encoding_file || '');
@@ -421,6 +428,27 @@
     }
   }
 
+  async function onToggleQueuePause() {
+    try {
+      if (queuePaused) {
+        await resumeEncodeQueue();
+        queuePaused = false;
+        show('Queue resumed', 'success');
+      } else {
+        await pauseEncodeQueue();
+        queuePaused = true;
+        show(
+          encodeActive
+            ? 'Paused — current encode will finish, then the queue stops'
+            : 'Queue paused',
+          'info'
+        );
+      }
+    } catch (err) {
+      show((err as Error).message, 'error');
+    }
+  }
+
   async function onDeleteLibrary(id: number, name: string) {
     if (!confirm(`Delete library file ${name}?`)) return;
     try {
@@ -587,7 +615,19 @@
         <span style="color:var(--warn);font-weight:700;">{encPct}</span>
       </div>
       <div class="bar-track"><div class="bar-fill bar-encode" style="width:{encBar}%"></div></div>
-      <div class="prog-sub">{encSub}</div>
+      <div class="prog-sub">
+        {encSub}{#if queuePaused} · pausing after this{/if}
+      </div>
+      <button
+        type="button"
+        class="btn btn-ghost narrow encode-pause"
+        onclick={onToggleQueuePause}
+        title={queuePaused
+          ? 'Resume encoding queued jobs'
+          : 'Finish the current encode, then stop the queue'}
+      >
+        {queuePaused ? 'Resume queue' : 'Pause queue'}
+      </button>
     </div>
 
     <button class="btn btn-primary" disabled={!queuedCount || uploadActive} onclick={upload}>
@@ -612,7 +652,16 @@
         </div>
         <span class="cpu-pct">{cpuPct != null ? `${cpuPct}%` : '—'}</span>
       </div>
-      <span class="enc-status">{footerEnc || (wsConnected ? 'Idle' : 'Offline')}</span>
+      <span class="enc-status">
+        {#if queuePaused && !footerEnc}
+          Queue paused
+        {:else}
+          {footerEnc || (wsConnected ? 'Idle' : 'Offline')}
+          {#if queuePaused && footerEnc}
+            · pausing after this
+          {/if}
+        {/if}
+      </span>
     </div>
 
     <div class="log-mini">
@@ -632,9 +681,26 @@
   </div>
 
   <div class="panel-right">
-    {#if activeJobs.length}
+    {#if activeJobs.length || queuePaused}
       <div class="section">
-        <div class="section-hdr"><h2>In progress</h2></div>
+        <div class="section-hdr">
+          <h2>
+            In progress
+            {#if queuePaused}
+              <span class="badge muted">paused</span>
+            {/if}
+          </h2>
+          <button
+            type="button"
+            class="btn btn-ghost narrow"
+            onclick={onToggleQueuePause}
+            title={queuePaused
+              ? 'Resume encoding queued jobs'
+              : 'Finish the current encode, then stop the queue'}
+          >
+            {queuePaused ? 'Resume queue' : 'Pause queue'}
+          </button>
+        </div>
         <div class="file-list">
           {#each activeJobs as j}
             <div class="file-row">
@@ -658,6 +724,8 @@
                 <button class="btn btn-ghost narrow" onclick={() => onCancel(j.id)}>Cancel</button>
               </div>
             </div>
+          {:else}
+            <div class="empty">Queue paused — nothing running</div>
           {/each}
         </div>
       </div>
@@ -992,6 +1060,10 @@
     color: var(--muted);
     margin-top: 4px;
   }
+  .encode-pause {
+    margin-top: 8px;
+    width: 100%;
+  }
   .btn {
     border: 1px solid var(--border);
     background: transparent;
@@ -1093,6 +1165,9 @@
   .section-hdr h2 {
     margin: 0;
     font-size: 0.95rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .file-list {
     display: flex;

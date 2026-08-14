@@ -67,6 +67,24 @@ export async function cancelJob(id: number): Promise<void> {
   }
 }
 
+export async function pauseEncodeQueue(): Promise<{ queue_paused: boolean }> {
+  const r = await fetch('/api/encode/pause', { method: 'POST' });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || 'Pause failed');
+  }
+  return r.json();
+}
+
+export async function resumeEncodeQueue(): Promise<{ queue_paused: boolean }> {
+  const r = await fetch('/api/encode/resume', { method: 'POST' });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || 'Resume failed');
+  }
+  return r.json();
+}
+
 export async function deleteLibrary(id: number): Promise<void> {
   const r = await fetch(`/api/library/${id}`, { method: 'DELETE' });
   if (!r.ok) {
