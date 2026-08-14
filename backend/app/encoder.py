@@ -189,7 +189,11 @@ def _keep_tracks_args(keep: bool) -> list[str]:
     """Override preset track selection so extra audio/subs are muxed, not burned."""
     if not keep:
         return []
-    return ["--all-audio", "--all-subtitles", "--subtitle-burned", "none"]
+    # --subtitle-burned takes an optional argument. A separate "none" token is
+    # ignored by getopt, so HandBrake treats it as --subtitle-burned (burn first
+    # track). Built-in HEVC presets also burn PGS/DVD subs, which drops that
+    # track from the output — only the remaining subs show up as tracks.
+    return ["--all-audio", "--all-subtitles", "--subtitle-burned=none"]
 
 
 async def run_encode(job_id: int) -> None:
