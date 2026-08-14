@@ -38,6 +38,7 @@ _current_encode_path: str | None = None
 _current_job_id: int | None = None
 _current_proc: asyncio.subprocess.Process | None = None
 _cancel_requested: set[int] = set()
+_queue_paused: bool = False
 
 
 def wakeup_job_worker() -> None:
@@ -66,6 +67,23 @@ def get_current_encode_path() -> str | None:
 
 def get_current_job_id() -> int | None:
     return _current_job_id
+
+
+def is_queue_paused() -> bool:
+    return _queue_paused
+
+
+def set_queue_paused(paused: bool) -> bool:
+    """Pause after the current encode, or resume draining the queue.
+
+    Returns True if the paused state changed.
+    """
+    global _queue_paused
+    if _queue_paused == paused:
+        return False
+    _queue_paused = paused
+    wakeup_job_worker()
+    return True
 
 
 def request_cancel(job_id: int) -> None:

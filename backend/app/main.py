@@ -50,7 +50,9 @@ from app.encoder import (
     extract_only,
     get_current_encode_path,
     get_current_job_id,
+    is_queue_paused,
     request_cancel,
+    set_queue_paused,
     signal_current_proc,
     wakeup_job_worker,
 )
@@ -605,6 +607,36 @@ async def cancel_job(job_id: int):
         db.close()
 
 
+@app.post("/api/encode/pause")
+async def pause_encode_queue():
+    """Stop picking up new jobs after the current encode/preview finishes."""
+    set_queue_paused(True)
+    log.info("Encode queue paused — current job will finish, then drain")
+    await manager.broadcast({"type": "queue_paused", "paused": True})
+    return JSONResponse(
+        {
+            "queue_paused": True,
+            "encoding": get_current_encode_path() is not None,
+            "job_id": get_current_job_id(),
+        }
+    )
+
+
+@app.post("/api/encode/resume")
+async def resume_encode_queue():
+    """Resume draining queued encode/preview jobs."""
+    set_queue_paused(False)
+    log.info("Encode queue resumed")
+    await manager.broadcast({"type": "queue_paused", "paused": False})
+    return JSONResponse(
+        {
+            "queue_paused": False,
+            "encoding": get_current_encode_path() is not None,
+            "job_id": get_current_job_id(),
+        }
+    )
+
+
 @app.get("/api/jobs/{job_id}/download")
 async def download_job_output(job_id: int):
     db = SessionLocal()
@@ -1053,6 +1085,7 @@ async def system_status():
             "encoding_size": encoding_size,
             "encoding_size_human": human_size(encoding_size) if encoding_size else None,
             "job_id": get_current_job_id(),
+            "queue_paused": is_queue_paused(),
         }
     )
 

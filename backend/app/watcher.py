@@ -11,6 +11,7 @@ from app.db import SessionLocal
 from app.encoder import (
     _encoding_lock,
     get_current_encode_path,
+    is_queue_paused,
     run_encode,
     run_preview,
     wait_for_job,
@@ -63,6 +64,9 @@ async def job_worker() -> None:
     _recover_stale_jobs()
     log.info("=== job worker started (DB queue) ===")
     while True:
+        if is_queue_paused():
+            await wait_for_job(2.0)
+            continue
         nxt = _next_queued_job()
         if nxt is None:
             await wait_for_job(2.0)
@@ -70,6 +74,8 @@ async def job_worker() -> None:
         job_id, kind = nxt
         log.info("WORKER pickup job=%s kind=%s", job_id, kind)
         async with _encoding_lock:
+            if is_queue_paused():
+                continue
             try:
                 if kind == "preview":
                     await run_preview(job_id)
@@ -127,7 +133,11 @@ async def broadcast_system_loop() -> None:
         except Exception:
             cpu = None
 
-        msg: dict = {"type": "system", "cpu_pct": cpu}
+        msg: dict = {
+            "type": "system",
+            "cpu_pct": cpu,
+            "queue_paused": is_queue_paused(),
+        }
         enc_path = get_current_encode_path()
         if enc_path:
             p = Path(enc_path)
