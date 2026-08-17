@@ -45,7 +45,16 @@ PRESET_MAP: dict[str, tuple[str, str, list[str]]] = {
     "hevc-2160-mp4": (
         "H.265 MKV 2160p60 4K",
         "mp4",
-        ["--encoder", "x265_10bit", "--encoder-profile", "main10"],
+        [
+            "--encoder",
+            "x265_10bit",
+            "--encoder-profile",
+            "main10",
+            "-q",
+            "30",
+            "-x",
+            "strong-intra-smoothing=0:rect=0:aq-mode=1:rd=4:psy-rd=0.75:psy-rdoq=4.0:rdoq-level=1:rskip=2:pools=12",
+        ],
     ),
     "h264-2160-mp4": ("H.264 MKV 2160p60 4K", "mp4", []),
     "hevc-1080-mkv": ("H.265 MKV 1080p30", "mkv", []),
