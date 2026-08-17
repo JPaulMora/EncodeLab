@@ -574,6 +574,46 @@
     }
   }
 
+  async function downloadSelected() {
+    const items: { url: string; name: string }[] = [];
+    for (const f of library) {
+      if (selected[`lib:${f.id}`] && f.download_url) {
+        items.push({ url: f.download_url, name: f.original_filename });
+      }
+    }
+    for (const f of outputs) {
+      if (selected[`out:${f.job_id}`] && f.download_url) {
+        items.push({ url: f.download_url, name: f.display_name });
+      }
+    }
+    if (!items.length) {
+      show('Select library files or outputs to download', 'info');
+      return;
+    }
+    bulkBusy = true;
+    try {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const a = document.createElement('a');
+        a.href = item.url;
+        a.download = item.name;
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        if (i < items.length - 1) {
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
+      show(
+        `Downloading ${items.length} file${items.length === 1 ? '' : 's'}…`,
+        'info'
+      );
+    } finally {
+      bulkBusy = false;
+    }
+  }
+
   async function deleteSelected() {
     const libs = library.filter((f) => selected[`lib:${f.id}`]);
     const outs = outputs.filter((f) => selected[`out:${f.job_id}`]);
@@ -929,6 +969,15 @@
           onclick={encodeSelected}
         >
           Encode all
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost narrow"
+          disabled={bulkBusy || !selectedEncodable}
+          title="Download each selected library file and output"
+          onclick={downloadSelected}
+        >
+          Download all
         </button>
         <button
           type="button"
