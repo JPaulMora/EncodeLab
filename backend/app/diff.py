@@ -11,14 +11,16 @@ from skimage.metrics import structural_similarity as ssim_fn
 
 DiffMode = Literal["absdiff", "ssim_map"]
 
-MAX_DECODED_BYTES = 10 * 1024 * 1024
+# Encoded PNG size (not decoded pixels). 4K / grainy Super8 frames routinely
+# exceed 10 MiB; 8-bit 3840×2160 uncompressed is ~25 MiB, 16-bit ~50 MiB.
+MAX_PNG_BYTES = 64 * 1024 * 1024
 MAX_DIMENSION = 4096
 
 
 def _load_png(path: Path) -> np.ndarray:
-    data = path.read_bytes()
-    if len(data) > MAX_DECODED_BYTES:
+    if path.stat().st_size > MAX_PNG_BYTES:
         raise ValueError("Image too large")
+    data = path.read_bytes()
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
@@ -92,12 +94,8 @@ def _metrics_only(a: np.ndarray, b: np.ndarray) -> dict:
     }
 
 
-def compare_png_bytes(source_png: bytes, dest_png: bytes) -> dict:
-    """SSIM / PSNR / MSE for in-memory PNG pair (no map image)."""
-    if len(source_png) > MAX_DECODED_BYTES or len(dest_png) > MAX_DECODED_BYTES:
-        raise ValueError("Image too large")
-    a = cv2.imdecode(np.frombuffer(source_png, dtype=np.uint8), cv2.IMREAD_COLOR)
-    b = cv2.imdecode(np.frombuffer(dest_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+def compare_bgr_frames(a: np.ndarray, b: np.ndarray) -> dict:
+    """SSIM / PSNR / MSE for in-memory BGR frames (no PNG roundtrip)."""
     if a is None or b is None:
         raise ValueError("Could not decode image")
     if a.shape[1] > MAX_DIMENSION or a.shape[0] > MAX_DIMENSION:
@@ -105,6 +103,15 @@ def compare_png_bytes(source_png: bytes, dest_png: bytes) -> dict:
     if b.shape[1] > MAX_DIMENSION or b.shape[0] > MAX_DIMENSION:
         raise ValueError("Image dimensions too large")
     return _metrics_only(a, b)
+
+
+def compare_png_bytes(source_png: bytes, dest_png: bytes) -> dict:
+    """SSIM / PSNR / MSE for in-memory PNG pair (no map image)."""
+    if len(source_png) > MAX_PNG_BYTES or len(dest_png) > MAX_PNG_BYTES:
+        raise ValueError("Image too large")
+    a = cv2.imdecode(np.frombuffer(source_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    b = cv2.imdecode(np.frombuffer(dest_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return compare_bgr_frames(a, b)
 
 
 def compare_frame_files(

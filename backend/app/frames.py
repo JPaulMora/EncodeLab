@@ -123,6 +123,8 @@ def extract_frame_at_time(path: Path, time_seconds: float) -> bytes:
         str(path),
         "-frames:v",
         "1",
+        "-pix_fmt",
+        "rgb24",
         "-f",
         "image2pipe",
         "-vcodec",
@@ -369,6 +371,27 @@ def preview_meta(source_clip: Path, dest_clip: Path) -> dict:
         "usable_frame_count": usable_frames,
         "pad_frames": PREVIEW_PAD_FRAMES,
     }
+
+
+def _bgr_from_png(png: bytes) -> np.ndarray | None:
+    frame = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return frame
+
+
+def _extract_bgr(path: Path, time_seconds: float) -> np.ndarray | None:
+    try:
+        return _bgr_from_png(extract_frame_at_time(path, max(0.0, time_seconds)))
+    except Exception:
+        return None
+
+
+def _read_cap_frame(
+    cap: cv2.VideoCapture, path: Path, time_seconds: float
+) -> np.ndarray | None:
+    ok, frame = cap.read()
+    if ok and frame is not None:
+        return frame
+    return _extract_bgr(path, time_seconds)
 
 
 def _gray_small_bgr(img: np.ndarray, width: int = 160) -> np.ndarray:
@@ -677,10 +700,12 @@ def compute_preview_noise_score(
 ) -> dict:
     """SSIM / PSNR / MSE mean±std over usable dest frames at a locked offset.
 
-    Skips pairs where source is OOB (clamped). Optionally caps frame count
-    via max_frames (evenly subsampled) for very long clips.
+    Sequential VideoCapture pass (same pairing as preview-frame):
+        source_clip_index = pad + dest_index + offset
+    Skips pairs where source is OOB. Optionally caps frame count via
+    max_frames (evenly subsampled) for very long clips.
     """
-    from app.diff import compare_png_bytes
+    from app.diff import compare_bgr_frames
 
     t0 = time.perf_counter()
     meta = preview_meta(source_clip, dest_clip)
@@ -688,57 +713,113 @@ def compute_preview_noise_score(
     if n <= 0:
         raise ValueError("No usable frames")
 
-    indices = list(range(n))
+    dst_fps = meta["dest_fps"] or 30.0
+    src_fps = meta["source_fps"] or 30.0
+    usable_start = float(meta["usable_start_seconds"])
+    pad = int(meta["pad_frames"])
+    dest_start = int(usable_start * dst_fps)
+
+    src_meta = probe_video(source_clip)
+    src_frames = src_meta["frame_count"] or int((src_meta["duration"] or 0) * src_fps) or 1
+
+    sample: set[int] | None = None
     if max_frames is not None and max_frames > 0 and n > max_frames:
-        # Evenly spaced sample including first and last
         step = (n - 1) / (max_frames - 1)
-        indices = sorted({int(round(i * step)) for i in range(max_frames)})
+        sample = {int(round(i * step)) for i in range(max_frames)}
+    sampled = n if sample is None else len(sample)
+
+    full_meta = None
+    if full_source and full_source.exists() and source_clip_start is not None:
+        try:
+            full_meta = probe_video(full_source)
+        except Exception:
+            full_meta = None
 
     _console(
-        f"noise-score: scoring {len(indices)}/{n} frames offset={offset} "
+        f"noise-score: scoring {sampled}/{n} frames offset={offset} "
         f"src={source_clip.name} dest={dest_clip.name}"
     )
+
+    dest_cap = cv2.VideoCapture(str(dest_clip))
+    src_cap = cv2.VideoCapture(str(source_clip))
+    if not dest_cap.isOpened():
+        src_cap.release()
+        raise ValueError("Could not open dest clip for noise score")
+    if not src_cap.isOpened():
+        dest_cap.release()
+        raise ValueError("Could not open source clip for noise score")
 
     ssims: list[float] = []
     psnrs: list[float] = []
     mses: list[float] = []
     skipped = 0
-    progress_every = max(1, len(indices) // 10)
+    src_next = 0
+    progress_every = max(1, n // 10)
     t_loop = time.perf_counter()
 
-    for i, idx in enumerate(indices):
-        pair = resolve_preview_pair(
-            source_clip=source_clip,
-            dest_clip=dest_clip,
-            index=idx,
-            offset=offset,
-            full_source=full_source,
-            source_clip_start=source_clip_start,
-        )
-        if pair["source_oob"]:
-            skipped += 1
-            continue
-        try:
-            m = compare_png_bytes(pair["source"], pair["dest"])
-        except Exception as exc:
-            skipped += 1
-            log.debug("noise-score: frame %s compare failed: %s", idx, exc)
-            continue
-        ssims.append(float(m["ssim"]))
-        mses.append(float(m["mse"]))
-        if m["psnr"] is not None:
-            psnrs.append(float(m["psnr"]))
+    def source_from_full(raw_idx: int) -> np.ndarray | None:
+        if full_meta is None or full_source is None or source_clip_start is None:
+            return None
+        abs_t = source_clip_start + (raw_idx / src_fps)
+        full_dur = full_meta["duration"] or 0.0
+        if not (0 <= abs_t < full_dur):
+            return None
+        return _extract_bgr(full_source, abs_t)
 
-        done = i + 1
-        if done % progress_every == 0 or done == len(indices):
-            elapsed = time.perf_counter() - t_loop
-            rate = done / elapsed if elapsed > 0 else 0
-            remaining = len(indices) - done
-            eta = remaining / rate if rate > 0 else 0
-            _console(
-                f"noise-score: {done}/{len(indices)} sampled "
-                f"(ok={len(ssims)} skip={skipped}, {rate:.1f}/s, ~{eta:.0f}s left)"
-            )
+    def source_at(idx: int) -> np.ndarray | None:
+        nonlocal src_next
+        if idx < 0:
+            return None
+        if idx < src_next:
+            src_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            src_next = idx
+        frame: np.ndarray | None = None
+        while src_next <= idx:
+            frame = _read_cap_frame(src_cap, source_clip, src_next / src_fps)
+            src_next += 1
+        return frame
+
+    try:
+        dest_cap.set(cv2.CAP_PROP_POS_FRAMES, dest_start)
+        for i in range(n):
+            dest_t = usable_start + (i / dst_fps)
+            dest_frame = _read_cap_frame(dest_cap, dest_clip, dest_t)
+            want = sample is None or i in sample
+            src_frame = None
+            if dest_frame is not None:
+                src_idx = pad + i + offset
+                if 0 <= src_idx < src_frames:
+                    src_frame = source_at(src_idx)
+                else:
+                    src_frame = source_from_full(src_idx)
+
+            if want:
+                if dest_frame is None or src_frame is None:
+                    skipped += 1
+                else:
+                    try:
+                        m = compare_bgr_frames(src_frame, dest_frame)
+                        ssims.append(float(m["ssim"]))
+                        mses.append(float(m["mse"]))
+                        if m["psnr"] is not None:
+                            psnrs.append(float(m["psnr"]))
+                    except Exception as exc:
+                        skipped += 1
+                        log.debug("noise-score: frame %s compare failed: %s", i, exc)
+
+            done = i + 1
+            if done % progress_every == 0 or done == n:
+                elapsed = time.perf_counter() - t_loop
+                rate = done / elapsed if elapsed > 0 else 0
+                remaining = n - done
+                eta = remaining / rate if rate > 0 else 0
+                _console(
+                    f"noise-score: {done}/{n} dest "
+                    f"(ok={len(ssims)} skip={skipped}, {rate:.1f}/s, ~{eta:.0f}s left)"
+                )
+    finally:
+        dest_cap.release()
+        src_cap.release()
 
     if not ssims:
         raise ValueError("No valid frame pairs to score (all OOB or failed)")
@@ -765,7 +846,7 @@ def compute_preview_noise_score(
 
     return {
         "frame_count": len(ssims),
-        "sampled": len(indices),
+        "sampled": sampled,
         "skipped": skipped,
         "offset": offset,
         "ssim_mean": ssim_mean,
