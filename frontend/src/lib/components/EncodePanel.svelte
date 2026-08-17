@@ -63,6 +63,8 @@
   /** Selected rows keyed by `lib:id`, `out:jobId`, or `job:id` */
   let selected = $state<Record<string, boolean>>({});
   let bulkBusy = $state(false);
+  let bulkPreset = $state('');
+  let bulkKeepTracks = $state(false);
 
   let ws: WebSocket | null = null;
   let wsBackoff = 1000;
@@ -102,13 +104,15 @@
     return presetFormats[preset] || '';
   }
 
-  function mp4TrackWarning(preset: string): string | undefined {
-    if (!keepTracks || formatFor(preset) !== 'mp4') return undefined;
+  function mp4TrackWarning(preset: string, keep = keepTracks): string | undefined {
+    if (!keep || formatFor(preset) !== 'mp4') return undefined;
     return 'MP4 can keep extra AAC/AC3 audio, but bitmap subtitles (PGS, DVD) and some codecs (DTS, TrueHD, FLAC) usually cannot be stored as extra tracks and may be skipped. Use an MKV preset to keep them.';
   }
 
   const mkvPresets = $derived(presets.filter((p) => formatFor(p) === 'mkv'));
   const mp4Presets = $derived(presets.filter((p) => formatFor(p) === 'mp4'));
+  const bulkPresetValue = $derived(bulkPreset || presets[0] || '');
+  const bulkMp4Warning = $derived(mp4TrackWarning(bulkPresetValue, bulkKeepTracks));
 
   function setPreset(key: string, value: string) {
     rowPreset = { ...rowPreset, [key]: value };
@@ -522,23 +526,27 @@
   }
 
   async function encodeSelected() {
-    const items: { source: JobSource; key: string }[] = [];
+    const items: JobSource[] = [];
     for (const f of library) {
-      if (selected[`lib:${f.id}`]) {
-        items.push({ source: { type: 'library', id: f.id }, key: `lib:${f.id}` });
-      }
+      if (selected[`lib:${f.id}`]) items.push({ type: 'library', id: f.id });
     }
     for (const f of outputs) {
-      if (selected[`out:${f.job_id}`]) {
-        items.push({ source: { type: 'job', id: f.job_id }, key: `job:${f.job_id}` });
-      }
+      if (selected[`out:${f.job_id}`]) items.push({ type: 'job', id: f.job_id });
     }
     if (!items.length) {
       show('Select library files or outputs to encode', 'info');
       return;
     }
+    const preset = bulkPresetValue;
+    if (!preset) {
+      show('Select a preset first', 'error');
+      return;
+    }
+    const tracks = bulkKeepTracks ? ' · extra tracks' : '';
     if (
-      !confirm(`Queue encode for ${items.length} item${items.length === 1 ? '' : 's'}?`)
+      !confirm(
+        `Queue encode for ${items.length} item${items.length === 1 ? '' : 's'} with [${preset}]${tracks}?`
+      )
     ) {
       return;
     }
@@ -548,14 +556,8 @@
     let lastErr = '';
     try {
       for (const item of items) {
-        const preset = presetFor(item.key);
-        if (!preset) {
-          fail += 1;
-          lastErr = 'Select a preset first';
-          continue;
-        }
         try {
-          await createJob(item.source, preset, 'encode', keepTracks);
+          await createJob(item, preset, 'encode', bulkKeepTracks);
           ok += 1;
         } catch (err) {
           fail += 1;
@@ -564,7 +566,7 @@
       }
       if (ok && fail) show(`✓ ${ok} queued, ${fail} failed${lastErr ? ` (${lastErr})` : ''}`, 'error');
       else if (fail) show(lastErr || 'Encode failed', 'error');
-      else show(`✓ ${ok} encode${ok === 1 ? '' : 's'} queued`, 'success');
+      else show(`✓ ${ok} encode${ok === 1 ? '' : 's'} queued with [${preset}]${tracks}`, 'success');
       if (!fail) clearSelection();
       await refreshLists();
     } finally {
@@ -693,6 +695,16 @@
       ? `${storageUsedHuman} used of ${storageTotalHuman}`
       : 'Storage usage'
   );
+
+  const storageLabel = $derived.by(() => {
+    if (!storageUsedHuman || !storageTotalHuman) return '—';
+    const used = storageUsedHuman.split(' ');
+    const total = storageTotalHuman.split(' ');
+    if (used.length === 2 && total.length === 2 && used[1] === total[1]) {
+      return `${used[0]} / ${total[0]} ${total[1]}`;
+    }
+    return `${storageUsedHuman} / ${storageTotalHuman}`;
+  });
 </script>
 
 <div class="layout">
@@ -856,7 +868,7 @@
         <div class="cpu-track">
           <div class="cpu-fill" style="width:{storagePct ?? 0}%;background:{storageColor}"></div>
         </div>
-        <span class="cpu-pct">{storagePct != null ? `${storagePct}%` : '—'}</span>
+        <span class="cpu-size">{storageLabel}</span>
       </div>
       <span class="enc-status">
         {#if queuePaused && !footerEnc}
@@ -890,11 +902,30 @@
     {#if selectedCount}
       <div class="selection-bar">
         <span class="selection-count">{selectedCount} selected</span>
+        <select
+          class="preset-mini"
+          class:preset-warn={Boolean(bulkMp4Warning)}
+          disabled={bulkBusy || !selectedEncodable}
+          value={bulkPresetValue}
+          title={bulkMp4Warning ?? 'Preset for Encode all'}
+          onchange={(e) => (bulkPreset = (e.currentTarget as HTMLSelectElement).value)}
+        >
+          {#each presets as p}
+            <option value={p}>{p}</option>
+          {/each}
+        </select>
+        <label class="keep-tracks bulk-keep" title={bulkMp4Warning ?? undefined}>
+          <input type="checkbox" bind:checked={bulkKeepTracks} disabled={bulkBusy || !selectedEncodable} />
+          Keep extra audio &amp; subtitles
+        </label>
+        {#if bulkMp4Warning}
+          <span class="tracks-row-warn" title={bulkMp4Warning}>MP4</span>
+        {/if}
         <button
           type="button"
           class="btn btn-ghost narrow"
-          disabled={bulkBusy || !selectedEncodable}
-          title="Queue an encode for each selected library file and output, using that row's preset"
+          disabled={bulkBusy || !selectedEncodable || !bulkPresetValue}
+          title="Queue an encode for each selected library file and output"
           onclick={encodeSelected}
         >
           Encode all
@@ -1412,6 +1443,13 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
+  .cpu-size {
+    flex-shrink: 0;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    color: var(--muted);
+  }
   .cpu-track {
     flex: 1;
     height: 4px;
@@ -1475,17 +1513,24 @@
     z-index: 2;
     display: flex;
     align-items: center;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 8px;
     padding: 8px 10px;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 8px;
   }
   .selection-count {
-    flex: 1;
-    min-width: 0;
     font-size: 0.8rem;
     font-weight: 600;
+    margin-right: 4px;
+  }
+  .selection-bar .preset-mini {
+    max-width: 140px;
+  }
+  .bulk-keep {
+    font-size: 0.75rem;
+    font-weight: 500;
   }
   .btn-danger {
     color: var(--danger);
