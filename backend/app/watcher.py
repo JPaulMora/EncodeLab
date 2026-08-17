@@ -6,7 +6,7 @@ import logging
 import time
 from pathlib import Path
 
-from app.config import human_size
+from app.config import disk_stats, human_size
 from app.db import SessionLocal
 from app.encoder import (
     _encoding_lock,
@@ -95,7 +95,7 @@ async def job_worker() -> None:
 
 
 async def broadcast_system_loop() -> None:
-    """Push CPU + encode status every 3 seconds."""
+    """Push CPU, storage, and encode status every 3 seconds."""
 
     def cgroup_usage_usec() -> int:
         try:
@@ -137,6 +137,7 @@ async def broadcast_system_loop() -> None:
             "type": "system",
             "cpu_pct": cpu,
             "queue_paused": is_queue_paused(),
+            **disk_stats(),
         }
         enc_path = get_current_encode_path()
         if enc_path:

@@ -40,6 +40,7 @@ from app.config import (
     PRESET_MAP,
     PREVIEW_PAD_FRAMES,
     UPLOAD_TMP,
+    disk_stats,
     ensure_dirs,
     human_size,
 )
@@ -1086,6 +1087,7 @@ async def system_status():
             "encoding_size_human": human_size(encoding_size) if encoding_size else None,
             "job_id": get_current_job_id(),
             "queue_paused": is_queue_paused(),
+            **disk_stats(),
         }
     )
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -94,3 +95,32 @@ def human_size(size: int | float) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+def disk_stats() -> dict:
+    """Filesystem usage for DATA_DIR (the encoder volume)."""
+    empty = {
+        "storage_pct": None,
+        "storage_used": None,
+        "storage_total": None,
+        "storage_free": None,
+        "storage_used_human": None,
+        "storage_total_human": None,
+        "storage_free_human": None,
+    }
+    try:
+        usage = shutil.disk_usage(DATA_DIR)
+    except OSError:
+        return empty
+    if usage.total <= 0:
+        return empty
+    pct = max(0, min(100, round(100 * usage.used / usage.total)))
+    return {
+        "storage_pct": pct,
+        "storage_used": usage.used,
+        "storage_total": usage.total,
+        "storage_free": usage.free,
+        "storage_used_human": human_size(usage.used),
+        "storage_total_human": human_size(usage.total),
+        "storage_free_human": human_size(usage.free),
+    }

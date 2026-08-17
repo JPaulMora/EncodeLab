@@ -43,6 +43,9 @@
   let encSub = $state('');
 
   let cpuPct = $state<number | null>(null);
+  let storagePct = $state<number | null>(null);
+  let storageUsedHuman = $state<string | null>(null);
+  let storageTotalHuman = $state<string | null>(null);
   let footerEnc = $state('');
   let logOpen = $state(false);
   let recentLines = $state<string[]>([]);
@@ -215,6 +218,9 @@
 
   function applySystemStatus(msg: Record<string, unknown>) {
     if (msg.cpu_pct != null) cpuPct = Number(msg.cpu_pct);
+    if (msg.storage_pct != null) storagePct = Number(msg.storage_pct);
+    if (msg.storage_used_human != null) storageUsedHuman = String(msg.storage_used_human);
+    if (msg.storage_total_human != null) storageTotalHuman = String(msg.storage_total_human);
     if (msg.queue_paused != null) queuePaused = Boolean(msg.queue_paused);
     if (msg.encoding) {
       if (!hasLiveProgress) currentEncodeFile = String(msg.encoding_file || '');
@@ -494,6 +500,22 @@
           ? 'var(--warn)'
           : 'var(--accent2)'
   );
+
+  const storageColor = $derived(
+    storagePct == null
+      ? 'var(--accent2)'
+      : storagePct >= 90
+        ? 'var(--danger)'
+        : storagePct >= 75
+          ? 'var(--warn)'
+          : 'var(--accent2)'
+  );
+
+  const storageTitle = $derived(
+    storageUsedHuman && storageTotalHuman
+      ? `${storageUsedHuman} used of ${storageTotalHuman}`
+      : 'Storage usage'
+  );
 </script>
 
 <div class="layout">
@@ -651,6 +673,13 @@
           <div class="cpu-fill" style="width:{cpuPct ?? 0}%;background:{cpuColor}"></div>
         </div>
         <span class="cpu-pct">{cpuPct != null ? `${cpuPct}%` : '—'}</span>
+      </div>
+      <div class="cpu-row" title={storageTitle}>
+        <span class="cpu-label">Storage</span>
+        <div class="cpu-track">
+          <div class="cpu-fill" style="width:{storagePct ?? 0}%;background:{storageColor}"></div>
+        </div>
+        <span class="cpu-pct">{storagePct != null ? `${storagePct}%` : '—'}</span>
       </div>
       <span class="enc-status">
         {#if queuePaused && !footerEnc}
@@ -1118,6 +1147,15 @@
     align-items: center;
     gap: 8px;
     font-size: 0.75rem;
+  }
+  .cpu-label {
+    min-width: 52px;
+    color: var(--muted);
+  }
+  .cpu-pct {
+    min-width: 2.6em;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
   .cpu-track {
     flex: 1;
