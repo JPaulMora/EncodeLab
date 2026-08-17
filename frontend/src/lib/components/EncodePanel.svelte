@@ -60,6 +60,9 @@
   /** Per-row preset pickers keyed by `lib:id` or `job:id` */
   let rowPreset = $state<Record<string, string>>({});
   let busyKey = $state<string | null>(null);
+  /** Selected rows keyed by `lib:id`, `out:jobId`, or `job:id` */
+  let selected = $state<Record<string, boolean>>({});
+  let bulkBusy = $state(false);
 
   let ws: WebSocket | null = null;
   let wsBackoff = 1000;
@@ -111,6 +114,41 @@
     rowPreset = { ...rowPreset, [key]: value };
   }
 
+  function toggleSelected(key: string) {
+    if (selected[key]) {
+      const next = { ...selected };
+      delete next[key];
+      selected = next;
+    } else {
+      selected = { ...selected, [key]: true };
+    }
+  }
+
+  function toggleSection(keys: string[]) {
+    const allOn = keys.length > 0 && keys.every((k) => selected[k]);
+    const next = { ...selected };
+    for (const k of keys) {
+      if (allOn) delete next[k];
+      else next[k] = true;
+    }
+    selected = next;
+  }
+
+  function clearSelection() {
+    selected = {};
+  }
+
+  function pruneSelection(valid: Set<string>) {
+    let changed = false;
+    const next = { ...selected };
+    for (const key of Object.keys(next)) {
+      if (valid.has(key)) continue;
+      delete next[key];
+      changed = true;
+    }
+    if (changed) selected = next;
+  }
+
   async function refreshLists() {
     try {
       const [lib, outs, j] = await Promise.all([
@@ -121,6 +159,14 @@
       library = lib;
       outputs = outs;
       jobs = j;
+      const active = new Set(['queued', 'encoding', 'previewing', 'extracting']);
+      pruneSelection(
+        new Set([
+          ...lib.map((f) => `lib:${f.id}`),
+          ...outs.map((f) => `out:${f.job_id}`),
+          ...j.filter((job) => active.has(job.status)).map((job) => `job:${job.id}`)
+        ])
+      );
     } catch {
       /* ignore transient */
     }
@@ -253,22 +299,32 @@
     }
   }
 
-  async function delOutput(presetName: string, name: string) {
+  async function deleteOutputFile(presetName: string, name: string) {
     if (currentEncodeFile && name === currentEncodeFile) {
-      alert('Cannot delete — this file is currently being encoded.');
-      return;
+      throw new Error('Cannot delete — this file is currently being encoded.');
     }
-    if (!confirm(`Delete output ${name}?`)) return;
     const r = await fetch(
       `/api/delete/${encodeURIComponent(presetName)}/${encodeURIComponent(name)}`,
       { method: 'DELETE' }
     );
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
-      alert(err.detail || 'Delete failed');
+      throw new Error(err.detail || 'Delete failed');
+    }
+  }
+
+  async function delOutput(presetName: string, name: string) {
+    if (currentEncodeFile && name === currentEncodeFile) {
+      alert('Cannot delete — this file is currently being encoded.');
       return;
     }
-    refreshLists();
+    if (!confirm(`Delete output ${name}?`)) return;
+    try {
+      await deleteOutputFile(presetName, name);
+      refreshLists();
+    } catch (err) {
+      alert((err as Error).message);
+    }
   }
 
   function isVideoFile(f: File): boolean {
@@ -465,10 +521,131 @@
     }
   }
 
+  async function encodeSelected() {
+    const items: { source: JobSource; key: string }[] = [];
+    for (const f of library) {
+      if (selected[`lib:${f.id}`]) {
+        items.push({ source: { type: 'library', id: f.id }, key: `lib:${f.id}` });
+      }
+    }
+    for (const f of outputs) {
+      if (selected[`out:${f.job_id}`]) {
+        items.push({ source: { type: 'job', id: f.job_id }, key: `job:${f.job_id}` });
+      }
+    }
+    if (!items.length) {
+      show('Select library files or outputs to encode', 'info');
+      return;
+    }
+    if (
+      !confirm(`Queue encode for ${items.length} item${items.length === 1 ? '' : 's'}?`)
+    ) {
+      return;
+    }
+    bulkBusy = true;
+    let ok = 0;
+    let fail = 0;
+    let lastErr = '';
+    try {
+      for (const item of items) {
+        const preset = presetFor(item.key);
+        if (!preset) {
+          fail += 1;
+          lastErr = 'Select a preset first';
+          continue;
+        }
+        try {
+          await createJob(item.source, preset, 'encode', keepTracks);
+          ok += 1;
+        } catch (err) {
+          fail += 1;
+          lastErr = (err as Error).message;
+        }
+      }
+      if (ok && fail) show(`✓ ${ok} queued, ${fail} failed${lastErr ? ` (${lastErr})` : ''}`, 'error');
+      else if (fail) show(lastErr || 'Encode failed', 'error');
+      else show(`✓ ${ok} encode${ok === 1 ? '' : 's'} queued`, 'success');
+      if (!fail) clearSelection();
+      await refreshLists();
+    } finally {
+      bulkBusy = false;
+    }
+  }
+
+  async function deleteSelected() {
+    const libs = library.filter((f) => selected[`lib:${f.id}`]);
+    const outs = outputs.filter((f) => selected[`out:${f.job_id}`]);
+    const running = activeJobs.filter((j) => selected[`job:${j.id}`]);
+    const n = libs.length + outs.length + running.length;
+    if (!n) return;
+    const bits: string[] = [];
+    if (libs.length) bits.push(`${libs.length} library file${libs.length === 1 ? '' : 's'}`);
+    if (outs.length) bits.push(`${outs.length} output${outs.length === 1 ? '' : 's'}`);
+    if (running.length) {
+      bits.push(`${running.length} in-progress job${running.length === 1 ? '' : 's'}`);
+    }
+    const msg = running.length
+      ? `Delete ${bits.join(', ')}? In-progress jobs will be cancelled.`
+      : `Delete ${bits.join(', ')}?`;
+    if (!confirm(msg)) return;
+
+    bulkBusy = true;
+    let ok = 0;
+    let fail = 0;
+    let lastErr = '';
+    try {
+      for (const j of running) {
+        try {
+          await cancelJob(j.id);
+          ok += 1;
+        } catch (err) {
+          fail += 1;
+          lastErr = (err as Error).message;
+        }
+      }
+      for (const f of libs) {
+        try {
+          await deleteLibrary(f.id);
+          ok += 1;
+        } catch (err) {
+          fail += 1;
+          lastErr = (err as Error).message;
+        }
+      }
+      for (const f of outs) {
+        try {
+          await deleteOutputFile(f.preset, f.name);
+          ok += 1;
+        } catch (err) {
+          fail += 1;
+          lastErr = (err as Error).message;
+        }
+      }
+      if (ok && fail) show(`✓ ${ok} removed, ${fail} failed${lastErr ? ` (${lastErr})` : ''}`, 'error');
+      else if (fail) show(lastErr || 'Delete failed', 'error');
+      else show(`✓ ${ok} removed`, 'success');
+      if (!fail) clearSelection();
+      await refreshLists();
+    } finally {
+      bulkBusy = false;
+    }
+  }
+
   const activeJobs = $derived(
     jobs.filter((j) =>
       ['queued', 'encoding', 'previewing', 'extracting'].includes(j.status)
     )
+  );
+
+  const libKeys = $derived(library.map((f) => `lib:${f.id}`));
+  const outKeys = $derived(outputs.map((f) => `out:${f.job_id}`));
+  const jobKeys = $derived(activeJobs.map((j) => `job:${j.id}`));
+  const libAll = $derived(libKeys.length > 0 && libKeys.every((k) => selected[k]));
+  const outAll = $derived(outKeys.length > 0 && outKeys.every((k) => selected[k]));
+  const jobAll = $derived(jobKeys.length > 0 && jobKeys.every((k) => selected[k]));
+  const selectedCount = $derived(Object.keys(selected).length);
+  const selectedEncodable = $derived(
+    Object.keys(selected).filter((k) => k.startsWith('lib:') || k.startsWith('out:')).length
   );
 
   onMount(() => {
@@ -710,6 +887,32 @@
   </div>
 
   <div class="panel-right">
+    {#if selectedCount}
+      <div class="selection-bar">
+        <span class="selection-count">{selectedCount} selected</span>
+        <button
+          type="button"
+          class="btn btn-ghost narrow"
+          disabled={bulkBusy || !selectedEncodable}
+          title="Queue an encode for each selected library file and output, using that row's preset"
+          onclick={encodeSelected}
+        >
+          Encode all
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost narrow btn-danger"
+          disabled={bulkBusy}
+          onclick={deleteSelected}
+        >
+          Delete all
+        </button>
+        <button type="button" class="btn btn-ghost narrow" disabled={bulkBusy} onclick={clearSelection}
+          >Clear</button
+        >
+      </div>
+    {/if}
+
     {#if activeJobs.length || queuePaused}
       <div class="section">
         <div class="section-hdr">
@@ -719,20 +922,37 @@
               <span class="badge muted">paused</span>
             {/if}
           </h2>
-          <button
-            type="button"
-            class="btn btn-ghost narrow"
-            onclick={onToggleQueuePause}
-            title={queuePaused
-              ? 'Resume encoding queued jobs'
-              : 'Finish the current encode, then stop the queue'}
-          >
-            {queuePaused ? 'Resume queue' : 'Pause queue'}
-          </button>
+          <div class="section-hdr-actions">
+            <button
+              type="button"
+              class="btn btn-ghost narrow"
+              disabled={!jobKeys.length}
+              onclick={() => toggleSection(jobKeys)}
+            >
+              {jobAll ? 'Deselect' : 'Select all'}
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost narrow"
+              onclick={onToggleQueuePause}
+              title={queuePaused
+                ? 'Resume encoding queued jobs'
+                : 'Finish the current encode, then stop the queue'}
+            >
+              {queuePaused ? 'Resume queue' : 'Pause queue'}
+            </button>
+          </div>
         </div>
         <div class="file-list">
           {#each activeJobs as j}
-            <div class="file-row">
+            <div class="file-row" class:selected={selected[`job:${j.id}`]}>
+              <label class="sel-check">
+                <input
+                  type="checkbox"
+                  checked={!!selected[`job:${j.id}`]}
+                  onchange={() => toggleSelected(`job:${j.id}`)}
+                />
+              </label>
               <div class="fi-body">
                 <div class="fi-name">
                   {j.filename}
@@ -782,14 +1002,31 @@
     </div>
 
     <div class="section">
-      <div class="section-hdr"><h2>Library</h2></div>
+      <div class="section-hdr">
+        <h2>Library</h2>
+        <button
+          type="button"
+          class="btn btn-ghost narrow"
+          disabled={!libKeys.length}
+          onclick={() => toggleSection(libKeys)}
+        >
+          {libAll ? 'Deselect' : 'Select all'}
+        </button>
+      </div>
       <div class="file-list">
         {#if !library.length}
           <div class="empty">No library files — upload a video</div>
         {:else}
           {#each library as f}
             {@const key = `lib:${f.id}`}
-            <div class="file-row">
+            <div class="file-row" class:selected={selected[key]}>
+              <label class="sel-check">
+                <input
+                  type="checkbox"
+                  checked={!!selected[key]}
+                  onchange={() => toggleSelected(key)}
+                />
+              </label>
               <div class="fi-body">
                 <div class="fi-name">{f.original_filename}</div>
                 <div class="fi-meta">{f.size_human} · library #{f.id}</div>
@@ -811,14 +1048,14 @@
                 {/if}
                 <button
                   class="btn btn-ghost narrow"
-                  disabled={busyKey === key + 'encode'}
+                  disabled={bulkBusy || busyKey === key + 'encode'}
                   title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'library', id: f.id }, 'encode', key)}
                   >Encode</button
                 >
                 <button
                   class="btn btn-ghost narrow"
-                  disabled={busyKey === key + 'preview'}
+                  disabled={bulkBusy || busyKey === key + 'preview'}
                   title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'library', id: f.id }, 'preview', key)}
                   >Preview</button
@@ -837,7 +1074,17 @@
     <div class="section">
       <div class="section-hdr">
         <h2>Encoded outputs</h2>
-        <button class="btn btn-ghost" onclick={() => goto('/compare')}>Compare</button>
+        <div class="section-hdr-actions">
+          <button
+            type="button"
+            class="btn btn-ghost narrow"
+            disabled={!outKeys.length}
+            onclick={() => toggleSection(outKeys)}
+          >
+            {outAll ? 'Deselect' : 'Select all'}
+          </button>
+          <button class="btn btn-ghost" onclick={() => goto('/compare')}>Compare</button>
+        </div>
       </div>
       <div class="file-list">
         {#if !outputs.length}
@@ -845,7 +1092,15 @@
         {:else}
           {#each outputs as f}
             {@const key = `job:${f.job_id}`}
-            <div class="file-row">
+            {@const sel = `out:${f.job_id}`}
+            <div class="file-row" class:selected={selected[sel]}>
+              <label class="sel-check">
+                <input
+                  type="checkbox"
+                  checked={!!selected[sel]}
+                  onchange={() => toggleSelected(sel)}
+                />
+              </label>
               <div class="fi-body">
                 <div class="fi-name">
                   {f.display_name}
@@ -874,14 +1129,14 @@
                 {/if}
                 <button
                   class="btn btn-ghost narrow"
-                  disabled={busyKey === key + 'encode'}
+                  disabled={bulkBusy || busyKey === key + 'encode'}
                   title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'job', id: f.job_id }, 'encode', key)}
                   >Encode</button
                 >
                 <button
                   class="btn btn-ghost narrow"
-                  disabled={busyKey === key + 'preview'}
+                  disabled={bulkBusy || busyKey === key + 'preview'}
                   title={mp4TrackWarning(presetFor(key))}
                   onclick={() => startJob({ type: 'job', id: f.job_id }, 'preview', key)}
                   >Preview</button
@@ -929,7 +1184,7 @@
     margin: 0 0 4px;
     font-size: 1rem;
   }
-  label:not(.dropzone),
+  label:not(.dropzone):not(.sel-check):not(.keep-tracks),
   .field-label {
     font-size: 0.75rem;
     color: var(--muted);
@@ -1199,6 +1454,7 @@
     justify-content: space-between;
     align-items: center;
     margin-bottom: 8px;
+    gap: 8px;
   }
   .section-hdr h2 {
     margin: 0;
@@ -1206,6 +1462,53 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+  .section-hdr-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .selection-bar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .selection-count {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .btn-danger {
+    color: var(--danger);
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.12);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .sel-check {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .sel-check input {
+    margin: 0;
+    accent-color: var(--accent);
   }
   .file-list {
     display: flex;
@@ -1220,6 +1523,10 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--panel-2, rgba(255, 255, 255, 0.02));
+  }
+  .file-row.selected {
+    border-color: rgba(108, 99, 255, 0.45);
+    background: rgba(108, 99, 255, 0.08);
   }
   .fi-body {
     flex: 1;
